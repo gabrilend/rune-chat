@@ -1,0 +1,1114 @@
+#!/usr/bin/env bash
+#
+# rs-sdk local server runner
+# Starts and manages the RuneScape SDK local development environment
+#
+
+set -e
+
+# =============================================================================
+# LOCAL ENVIRONMENT SETUP
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIBS_ENV="${SCRIPT_DIR}/../libs/env.sh"
+
+# Source local dependencies environment if available
+if [[ -f "$LIBS_ENV" ]]; then
+    source "$LIBS_ENV" 2>/dev/null || true
+fi
+
+# =============================================================================
+# DEFAULTS (overridden by config file, then by command line flags)
+# =============================================================================
+
+PROJECT_ROOT="/home/ritz/programming/ai-stuff/runescape/rs-sdk"
+START_ENGINE=true
+START_GATEWAY=true
+START_WEBCLIENT=false
+DEV_MODE=false
+BACKGROUND=false
+BUILD_WEBCLIENT=false
+COPY_CLIENT_FILES=false
+ENGINE_WEB_PORT=8243
+ENGINE_GAME_PORT=8244
+ENGINE_CORS=false
+ENGINE_NODE_ID=10
+ENGINE_MEMBERS=true
+ENGINE_XP_RATE=1
+ENGINE_RUN_DRAIN_RATE=0
+ENGINE_PRODUCTION=false
+ENGINE_RANDOM_EVENT_RATE=0
+ENGINE_DEBUG=true
+ENGINE_MAX_PLAYERS=2047
+ENGINE_MAX_NPCS=8191
+GATEWAY_PORT=8245
+DB_BACKEND=sqlite
+RUN_MIGRATIONS=false
+RESET_DATABASE=false
+NIXOS_PRISMA_COMPAT=true
+PRISMA_IGNORE_CHECKSUM=true
+LOG_LEVEL=info
+COLOR_OUTPUT=true
+VERBOSE=false
+QUIET=false
+LOG_FILE=""
+OPEN_BROWSER=false
+BROWSER_URL="http://localhost:8243"
+KILL_EXISTING=false
+PID_DIR="/tmp/rs-sdk-pids"
+STARTUP_DELAY=2
+HEALTH_CHECK_TIMEOUT=30
+DEFAULT_BOT_NAME=""
+AUTO_START_BOT=false
+BOT_SHOW_CHAT=false
+
+# =============================================================================
+# COLOR DEFINITIONS
+# =============================================================================
+
+setup_colors() {
+    if [[ "$COLOR_OUTPUT" == "true" ]] && [[ -t 1 ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        BOLD='\033[1m'
+        DIM='\033[2m'
+        NC='\033[0m'
+    else
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BLUE=''
+        MAGENTA=''
+        CYAN=''
+        BOLD=''
+        DIM=''
+        NC=''
+    fi
+}
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+
+    [[ "$QUIET" == "true" ]] && [[ "$level" != "error" ]] && return
+
+    case "$level" in
+        debug)
+            [[ "$VERBOSE" != "true" ]] && return
+            echo -e "${DIM}[$timestamp]${NC} ${CYAN}[DEBUG]${NC} $message"
+            ;;
+        info)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}[INFO]${NC} $message"
+            ;;
+        warn)
+            echo -e "${DIM}[$timestamp]${NC} ${YELLOW}[WARN]${NC} $message"
+            ;;
+        error)
+            echo -e "${DIM}[$timestamp]${NC} ${RED}[ERROR]${NC} $message" >&2
+            ;;
+        success)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}${BOLD}[OK]${NC} $message"
+            ;;
+        header)
+            echo -e "\n${BOLD}${BLUE}=== $message ===${NC}\n"
+            ;;
+    esac
+
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
+}
+
+# =============================================================================
+# CONFIG FILE LOADING
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/../config/run.conf"
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log debug "Loading config from $CONFIG_FILE"
+        # Source config file, filtering out comments and empty lines
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            # Remove leading/trailing whitespace and quotes
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+            # Export the variable
+            if [[ -n "$key" ]] && [[ -n "$value" ]]; then
+                export "$key"="$value"
+            fi
+        done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep '=')
+    fi
+}
+
+# =============================================================================
+# USAGE / HELP
+# =============================================================================
+
+show_help() {
+    cat << EOF
+${BOLD}rs-sdk local server runner${NC}
+
+${BOLD}USAGE:${NC}
+    $(basename "$0") [OPTIONS] [COMMAND]
+
+${BOLD}COMMANDS:${NC}
+    start           Start the server (default)
+    stop            Stop all running components
+    restart         Restart all components
+    status          Show status of components
+    logs            Show logs (requires -f for follow)
+    build           Build webclient only
+    migrate         Run database migrations only
+    push-db         Push schema to database (no migration history)
+    reset-db        Reset database (DANGEROUS)
+    create-bot      Create a new bot (requires --bot-name)
+
+${BOLD}COMPONENT OPTIONS:${NC}
+    -e, --engine                Start engine (default: on)
+    -E, --no-engine             Don't start engine
+    -g, --gateway               Start gateway (default: on)
+    -G, --no-gateway            Don't start gateway
+    -w, --webclient             Start webclient watcher
+    -W, --no-webclient          Don't start webclient (default)
+    -a, --all                   Start all components
+    -o, --only COMPONENT        Start only specified component (engine|gateway|webclient)
+
+${BOLD}MODE OPTIONS:${NC}
+    -d, --dev                   Development mode with hot-reload
+    -p, --production            Production mode
+    -b, --background            Run in background
+    -f, --foreground            Run in foreground (default)
+    --build                     Build webclient before starting
+    --copy-assets               Copy built client files to engine
+
+${BOLD}ENGINE OPTIONS:${NC}
+    --web-port PORT             Web server port (default: 8243)
+    --game-port PORT            Game server port (default: 8244)
+    --node-id ID                Node ID (default: 10)
+    --xp-rate RATE              XP rate multiplier (default: 1)
+    --max-players NUM           Max players (default: 2047)
+    --max-npcs NUM              Max NPCs (default: 8191)
+    --cors                      Enable CORS
+    --no-cors                   Disable CORS (default)
+    --members                   Members server (default)
+    --no-members                Free-to-play server
+    --random-event-rate NUM     Random event rate (0=off, 100=normal, default: 0)
+    --run-drain-rate NUM        Run energy drain rate (0=infinite, 100=normal, default: 0)
+    --debug                     Enable debug mode (default)
+    --no-debug                  Disable debug mode
+
+${BOLD}GATEWAY OPTIONS:${NC}
+    --gateway-port PORT         Gateway port (default: 8245)
+
+${BOLD}DATABASE OPTIONS:${NC}
+    --db-backend BACKEND        Database backend: sqlite|mysql (default: sqlite)
+    --migrate                   Run migrations on startup
+    --reset-db                  Reset database on startup (DANGEROUS)
+
+${BOLD}NIXOS OPTIONS:${NC}
+    --nixos-compat              Enable NixOS Prisma compatibility (default)
+    --no-nixos-compat           Disable NixOS Prisma compatibility
+    --prisma-ignore-checksum    Ignore Prisma checksum errors (default)
+    --no-prisma-ignore-checksum Require Prisma checksum validation
+
+${BOLD}OUTPUT OPTIONS:${NC}
+    -v, --verbose               Verbose output
+    -q, --quiet                 Quiet mode (errors only)
+    --log-level LEVEL           Log level: debug|info|warn|error
+    --log-file FILE             Log to file
+    --no-color                  Disable colored output
+    --color                     Enable colored output (default)
+
+${BOLD}BROWSER OPTIONS:${NC}
+    --open-browser              Open browser on start
+    --no-open-browser           Don't open browser (default)
+    --browser-url URL           URL to open (default: http://localhost:80)
+
+${BOLD}PROCESS OPTIONS:${NC}
+    -k, --kill                  Kill existing processes before starting
+    --pid-dir DIR               PID file directory (default: /tmp/rs-sdk-pids)
+    --startup-delay SECS        Delay between starting components (default: 2)
+    --health-timeout SECS       Health check timeout (default: 30)
+
+${BOLD}BOT OPTIONS:${NC}
+    --bot-name NAME             Bot username
+    --auto-bot                  Auto-start bot after server ready
+    --show-chat                 Show chat in bot
+    --no-show-chat              Hide chat in bot (default)
+
+${BOLD}PATH OPTIONS:${NC}
+    --project-root DIR          Project root directory
+    --config FILE               Config file path (default: ../config/run.conf)
+
+${BOLD}OTHER OPTIONS:${NC}
+    -h, --help                  Show this help message
+    --version                   Show version
+    --dry-run                   Show what would be done without doing it
+    --dump-config               Dump current configuration
+
+${BOLD}EXAMPLES:${NC}
+    $(basename "$0")                          # Start engine + gateway
+    $(basename "$0") -a                       # Start all components
+    $(basename "$0") -o engine                # Start only engine
+    $(basename "$0") -d --build               # Dev mode, build first
+    $(basename "$0") -b -k                    # Background, kill existing
+    $(basename "$0") --web-port 8080          # Custom web port
+    $(basename "$0") stop                     # Stop all components
+    $(basename "$0") create-bot --bot-name foo # Create bot named "foo"
+
+${BOLD}CONFIG FILE:${NC}
+    Settings can be defined in: $CONFIG_FILE
+    Command line flags override config file settings.
+
+EOF
+}
+
+show_version() {
+    echo "rs-sdk runner v1.0.0"
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+COMMAND="start"
+DRY_RUN=false
+DUMP_CONFIG=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # Commands
+            start|stop|restart|status|logs|build|migrate|push-db|reset-db|create-bot)
+                COMMAND="$1"
+                shift
+                ;;
+
+            # Component options
+            -e|--engine) START_ENGINE=true; shift ;;
+            -E|--no-engine) START_ENGINE=false; shift ;;
+            -g|--gateway) START_GATEWAY=true; shift ;;
+            -G|--no-gateway) START_GATEWAY=false; shift ;;
+            -w|--webclient) START_WEBCLIENT=true; shift ;;
+            -W|--no-webclient) START_WEBCLIENT=false; shift ;;
+            -a|--all)
+                START_ENGINE=true
+                START_GATEWAY=true
+                START_WEBCLIENT=true
+                shift
+                ;;
+            -o|--only)
+                START_ENGINE=false
+                START_GATEWAY=false
+                START_WEBCLIENT=false
+                case "$2" in
+                    engine) START_ENGINE=true ;;
+                    gateway) START_GATEWAY=true ;;
+                    webclient) START_WEBCLIENT=true ;;
+                    *) log error "Unknown component: $2"; exit 1 ;;
+                esac
+                shift 2
+                ;;
+
+            # Mode options
+            -d|--dev) DEV_MODE=true; shift ;;
+            -p|--production) ENGINE_PRODUCTION=true; DEV_MODE=false; shift ;;
+            -b|--background) BACKGROUND=true; shift ;;
+            -f|--foreground) BACKGROUND=false; shift ;;
+            --build) BUILD_WEBCLIENT=true; shift ;;
+            --copy-assets) COPY_CLIENT_FILES=true; shift ;;
+
+            # Engine options
+            --web-port) ENGINE_WEB_PORT="$2"; shift 2 ;;
+            --game-port) ENGINE_GAME_PORT="$2"; shift 2 ;;
+            --node-id) ENGINE_NODE_ID="$2"; shift 2 ;;
+            --xp-rate) ENGINE_XP_RATE="$2"; shift 2 ;;
+            --max-players) ENGINE_MAX_PLAYERS="$2"; shift 2 ;;
+            --max-npcs) ENGINE_MAX_NPCS="$2"; shift 2 ;;
+            --cors) ENGINE_CORS=true; shift ;;
+            --no-cors) ENGINE_CORS=false; shift ;;
+            --members) ENGINE_MEMBERS=true; shift ;;
+            --no-members) ENGINE_MEMBERS=false; shift ;;
+            --random-event-rate) ENGINE_RANDOM_EVENT_RATE="$2"; shift 2 ;;
+            --run-drain-rate) ENGINE_RUN_DRAIN_RATE="$2"; shift 2 ;;
+            --debug) ENGINE_DEBUG=true; shift ;;
+            --no-debug) ENGINE_DEBUG=false; shift ;;
+
+            # Gateway options
+            --gateway-port) GATEWAY_PORT="$2"; shift 2 ;;
+
+            # Database options
+            --db-backend) DB_BACKEND="$2"; shift 2 ;;
+            --migrate) RUN_MIGRATIONS=true; shift ;;
+            --reset-db) RESET_DATABASE=true; shift ;;
+
+            # NixOS options
+            --nixos-compat) NIXOS_PRISMA_COMPAT=true; shift ;;
+            --no-nixos-compat) NIXOS_PRISMA_COMPAT=false; shift ;;
+            --prisma-ignore-checksum) PRISMA_IGNORE_CHECKSUM=true; shift ;;
+            --no-prisma-ignore-checksum) PRISMA_IGNORE_CHECKSUM=false; shift ;;
+
+            # Output options
+            -v|--verbose) VERBOSE=true; shift ;;
+            -q|--quiet) QUIET=true; shift ;;
+            --log-level) LOG_LEVEL="$2"; shift 2 ;;
+            --log-file) LOG_FILE="$2"; shift 2 ;;
+            --no-color) COLOR_OUTPUT=false; shift ;;
+            --color) COLOR_OUTPUT=true; shift ;;
+
+            # Browser options
+            --open-browser) OPEN_BROWSER=true; shift ;;
+            --no-open-browser) OPEN_BROWSER=false; shift ;;
+            --browser-url) BROWSER_URL="$2"; shift 2 ;;
+
+            # Process options
+            -k|--kill) KILL_EXISTING=true; shift ;;
+            --pid-dir) PID_DIR="$2"; shift 2 ;;
+            --startup-delay) STARTUP_DELAY="$2"; shift 2 ;;
+            --health-timeout) HEALTH_CHECK_TIMEOUT="$2"; shift 2 ;;
+
+            # Bot options
+            --bot-name) DEFAULT_BOT_NAME="$2"; shift 2 ;;
+            --auto-bot) AUTO_START_BOT=true; shift ;;
+            --show-chat) BOT_SHOW_CHAT=true; shift ;;
+            --no-show-chat) BOT_SHOW_CHAT=false; shift ;;
+
+            # Path options
+            --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+            --config)
+                CONFIG_FILE="$2"
+                load_config
+                shift 2
+                ;;
+
+            # Other options
+            -h|--help) show_help; exit 0 ;;
+            --version) show_version; exit 0 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --dump-config) DUMP_CONFIG=true; shift ;;
+
+            # Unknown
+            -*)
+                log error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                log error "Unknown argument: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# CONFIGURATION DUMP
+# =============================================================================
+
+dump_config() {
+    cat << EOF
+${BOLD}Current Configuration:${NC}
+
+${CYAN}Paths:${NC}
+  PROJECT_ROOT=${PROJECT_ROOT}
+  CONFIG_FILE=${CONFIG_FILE}
+  PID_DIR=${PID_DIR}
+
+${CYAN}Components:${NC}
+  START_ENGINE=${START_ENGINE}
+  START_GATEWAY=${START_GATEWAY}
+  START_WEBCLIENT=${START_WEBCLIENT}
+
+${CYAN}Modes:${NC}
+  DEV_MODE=${DEV_MODE}
+  BACKGROUND=${BACKGROUND}
+  BUILD_WEBCLIENT=${BUILD_WEBCLIENT}
+  COPY_CLIENT_FILES=${COPY_CLIENT_FILES}
+
+${CYAN}Engine:${NC}
+  ENGINE_WEB_PORT=${ENGINE_WEB_PORT}
+  ENGINE_GAME_PORT=${ENGINE_GAME_PORT}
+  ENGINE_NODE_ID=${ENGINE_NODE_ID}
+  ENGINE_MEMBERS=${ENGINE_MEMBERS}
+  ENGINE_XP_RATE=${ENGINE_XP_RATE}
+  ENGINE_RUN_DRAIN_RATE=${ENGINE_RUN_DRAIN_RATE}
+  ENGINE_PRODUCTION=${ENGINE_PRODUCTION}
+  ENGINE_RANDOM_EVENT_RATE=${ENGINE_RANDOM_EVENT_RATE}
+  ENGINE_DEBUG=${ENGINE_DEBUG}
+  ENGINE_MAX_PLAYERS=${ENGINE_MAX_PLAYERS}
+  ENGINE_MAX_NPCS=${ENGINE_MAX_NPCS}
+  ENGINE_CORS=${ENGINE_CORS}
+
+${CYAN}Gateway:${NC}
+  GATEWAY_PORT=${GATEWAY_PORT}
+
+${CYAN}Database:${NC}
+  DB_BACKEND=${DB_BACKEND}
+  RUN_MIGRATIONS=${RUN_MIGRATIONS}
+  RESET_DATABASE=${RESET_DATABASE}
+
+${CYAN}NixOS:${NC}
+  NIXOS_PRISMA_COMPAT=${NIXOS_PRISMA_COMPAT}
+  PRISMA_IGNORE_CHECKSUM=${PRISMA_IGNORE_CHECKSUM}
+
+${CYAN}Output:${NC}
+  LOG_LEVEL=${LOG_LEVEL}
+  COLOR_OUTPUT=${COLOR_OUTPUT}
+  VERBOSE=${VERBOSE}
+  QUIET=${QUIET}
+  LOG_FILE=${LOG_FILE}
+
+${CYAN}Browser:${NC}
+  OPEN_BROWSER=${OPEN_BROWSER}
+  BROWSER_URL=${BROWSER_URL}
+
+${CYAN}Process:${NC}
+  KILL_EXISTING=${KILL_EXISTING}
+  STARTUP_DELAY=${STARTUP_DELAY}
+  HEALTH_CHECK_TIMEOUT=${HEALTH_CHECK_TIMEOUT}
+
+${CYAN}Bot:${NC}
+  DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME}
+  AUTO_START_BOT=${AUTO_START_BOT}
+  BOT_SHOW_CHAT=${BOT_SHOW_CHAT}
+EOF
+}
+
+# =============================================================================
+# NIXOS / PRISMA SETUP
+# =============================================================================
+
+setup_prisma_env() {
+    if [[ "$NIXOS_PRISMA_COMPAT" != "true" ]]; then
+        return
+    fi
+
+    log debug "Setting up Prisma environment"
+
+    # Local libs directory (built from source)
+    local local_prisma="${SCRIPT_DIR}/../libs/prisma-engines"
+
+    # Prefer locally built Prisma engines
+    if [[ -x "${local_prisma}/schema-engine" ]]; then
+        export PRISMA_SCHEMA_ENGINE_BINARY="${local_prisma}/schema-engine"
+        log debug "Using local schema-engine"
+    elif command -v schema-engine &> /dev/null; then
+        export PRISMA_SCHEMA_ENGINE_BINARY=$(which schema-engine)
+        log debug "Using system schema-engine"
+    fi
+
+    if [[ -x "${local_prisma}/query-engine" ]]; then
+        export PRISMA_QUERY_ENGINE_BINARY="${local_prisma}/query-engine"
+        log debug "Using local query-engine"
+    elif command -v query-engine &> /dev/null; then
+        export PRISMA_QUERY_ENGINE_BINARY=$(which query-engine)
+        log debug "Using system query-engine"
+    fi
+
+    if [[ -f "${local_prisma}/libquery_engine.node" ]]; then
+        export PRISMA_QUERY_ENGINE_LIBRARY="${local_prisma}/libquery_engine.node"
+        log debug "Using local libquery_engine.node"
+    elif command -v query-engine &> /dev/null; then
+        local engine_dir
+        engine_dir=$(dirname "$(which query-engine)")
+        local lib_path="${engine_dir}/../lib/libquery_engine.node"
+        if [[ -f "$lib_path" ]]; then
+            export PRISMA_QUERY_ENGINE_LIBRARY="$lib_path"
+            log debug "Using system libquery_engine.node"
+        fi
+    fi
+
+    if command -v prisma-fmt &> /dev/null; then
+        export PRISMA_FMT_BINARY=$(which prisma-fmt)
+    fi
+
+    if [[ "$PRISMA_IGNORE_CHECKSUM" == "true" ]]; then
+        export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
+    fi
+
+    log debug "PRISMA_SCHEMA_ENGINE_BINARY=${PRISMA_SCHEMA_ENGINE_BINARY:-not set}"
+    log debug "PRISMA_QUERY_ENGINE_BINARY=${PRISMA_QUERY_ENGINE_BINARY:-not set}"
+    log debug "PRISMA_QUERY_ENGINE_LIBRARY=${PRISMA_QUERY_ENGINE_LIBRARY:-not set}"
+}
+
+# =============================================================================
+# ENGINE ENVIRONMENT
+# =============================================================================
+
+setup_engine_env() {
+    log debug "Setting up engine environment"
+
+    # Create .env file content
+    local env_content=""
+
+    env_content+="WEB_PORT=${ENGINE_WEB_PORT}\n"
+    [[ "$ENGINE_CORS" == "true" ]] && env_content+="WEB_CORS=true\n"
+    [[ "$ENGINE_NODE_ID" != "10" ]] && env_content+="NODE_ID=${ENGINE_NODE_ID}\n"
+    env_content+="NODE_PORT=${ENGINE_GAME_PORT}\n"
+    [[ "$ENGINE_MEMBERS" == "false" ]] && env_content+="NODE_MEMBERS=false\n"
+    [[ "$ENGINE_XP_RATE" != "1" ]] && env_content+="NODE_XPRATE=${ENGINE_XP_RATE}\n"
+    [[ "$ENGINE_RUN_DRAIN_RATE" != "0" ]] && env_content+="NODE_RUN_DRAIN_RATE=${ENGINE_RUN_DRAIN_RATE}\n"
+    [[ "$ENGINE_PRODUCTION" == "true" ]] && env_content+="NODE_PRODUCTION=true\n"
+    [[ "$ENGINE_RANDOM_EVENT_RATE" != "0" ]] && env_content+="NODE_RANDOM_EVENT_RATE=${ENGINE_RANDOM_EVENT_RATE}\n"
+    [[ "$ENGINE_DEBUG" == "false" ]] && env_content+="NODE_DEBUG=false\n"
+    [[ "$ENGINE_MAX_PLAYERS" != "2047" ]] && env_content+="NODE_MAX_PLAYERS=${ENGINE_MAX_PLAYERS}\n"
+    [[ "$ENGINE_MAX_NPCS" != "8191" ]] && env_content+="NODE_MAX_NPCS=${ENGINE_MAX_NPCS}\n"
+    env_content+="DB_BACKEND=${DB_BACKEND}\n"
+    env_content+="GATEWAY_URL=http://localhost:${GATEWAY_PORT}\n"
+
+    # Write to .env
+    log debug "Writing engine .env file"
+    echo -e "$env_content" > "${PROJECT_ROOT}/engine/.env"
+}
+
+# =============================================================================
+# PROCESS MANAGEMENT
+# =============================================================================
+
+PIDS=()
+
+cleanup() {
+    log info "Shutting down..."
+
+    for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            log debug "Killing process $pid"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Clean up PID files
+    rm -f "${PID_DIR}"/*.pid 2>/dev/null || true
+
+    log success "Shutdown complete"
+}
+
+trap cleanup EXIT INT TERM
+
+mkdir_pid_dir() {
+    mkdir -p "$PID_DIR"
+}
+
+save_pid() {
+    local name="$1"
+    local pid="$2"
+    echo "$pid" > "${PID_DIR}/${name}.pid"
+    PIDS+=("$pid")
+}
+
+get_pid() {
+    local name="$1"
+    local pid_file="${PID_DIR}/${name}.pid"
+    if [[ -f "$pid_file" ]]; then
+        cat "$pid_file"
+    fi
+}
+
+is_running() {
+    local name="$1"
+    local pid
+    pid=$(get_pid "$name")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+kill_existing_processes() {
+    log info "Killing existing processes..."
+
+    for name in engine gateway webclient; do
+        if is_running "$name"; then
+            local pid
+            pid=$(get_pid "$name")
+            log debug "Killing $name (PID: $pid)"
+            kill "$pid" 2>/dev/null || true
+            rm -f "${PID_DIR}/${name}.pid"
+        fi
+    done
+
+    # Also try to kill by port
+    if command -v fuser &> /dev/null; then
+        fuser -k "${ENGINE_WEB_PORT}/tcp" 2>/dev/null || true
+        fuser -k "${ENGINE_GAME_PORT}/tcp" 2>/dev/null || true
+        fuser -k "${GATEWAY_PORT}/tcp" 2>/dev/null || true
+    fi
+
+    sleep 1
+}
+
+# =============================================================================
+# BUILD
+# =============================================================================
+
+build_webclient() {
+    log header "Building Webclient"
+
+    cd "${PROJECT_ROOT}/webclient"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun run build"
+        return
+    fi
+
+    log info "Building webclient..."
+    bun run build
+
+    log success "Webclient built successfully"
+}
+
+copy_client_files() {
+    log info "Copying client files to engine..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would copy client files"
+        return
+    fi
+
+    mkdir -p "${PROJECT_ROOT}/engine/public/client"
+    mkdir -p "${PROJECT_ROOT}/engine/public/bot"
+
+    # Copy all webclient output files (js, wasm, etc.)
+    cp "${PROJECT_ROOT}/webclient/out/standard/"* "${PROJECT_ROOT}/engine/public/client/"
+    cp "${PROJECT_ROOT}/webclient/out/bot/"* "${PROJECT_ROOT}/engine/public/bot/"
+
+    log success "Client files copied"
+}
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+
+run_migrations() {
+    log header "Running Database Migrations"
+
+    cd "${PROJECT_ROOT}/engine"
+    setup_prisma_env
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run migrations"
+        return
+    fi
+
+    if [[ "$DB_BACKEND" == "sqlite" ]]; then
+        log info "Running SQLite migrations..."
+        bun run sqlite:migrate
+    else
+        log info "Running MySQL migrations..."
+        bun run db:migrate
+    fi
+
+    log success "Migrations complete"
+}
+
+push_database() {
+    log header "Pushing Database Schema"
+
+    cd "${PROJECT_ROOT}/engine"
+    setup_prisma_env
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would push schema"
+        return
+    fi
+
+    log info "Pushing schema to database..."
+    bun run db:push
+
+    log success "Schema push complete"
+}
+
+reset_database() {
+    log header "Resetting Database"
+
+    log warn "This will DELETE ALL DATA in the database!"
+    read -p "Are you sure? (y/N) " -n 1 -r
+    echo
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log info "Aborted"
+        return
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+    setup_prisma_env
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would reset database"
+        return
+    fi
+
+    if [[ "$DB_BACKEND" == "sqlite" ]]; then
+        log info "Resetting SQLite database..."
+        bun run sqlite:reset
+    else
+        log info "Resetting MySQL database..."
+        bun run db:reset
+    fi
+
+    log success "Database reset complete"
+}
+
+# =============================================================================
+# START COMPONENTS
+# =============================================================================
+
+start_engine() {
+    log info "Starting engine..."
+
+    cd "${PROJECT_ROOT}/engine"
+    setup_engine_env
+
+    local cmd="bun run quickstart"
+    if [[ "$DEV_MODE" == "true" ]]; then
+        cmd="bun run dev"
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: $cmd"
+        return
+    fi
+
+    if [[ "$BACKGROUND" == "true" ]]; then
+        $cmd > "${PID_DIR}/engine.log" 2>&1 &
+        save_pid "engine" $!
+        log success "Engine started in background (PID: $!)"
+    else
+        $cmd &
+        save_pid "engine" $!
+        log success "Engine started (PID: $!)"
+    fi
+}
+
+start_gateway() {
+    log info "Starting gateway..."
+
+    cd "${PROJECT_ROOT}/gateway"
+
+    local cmd="bun run gateway"
+    if [[ "$DEV_MODE" == "true" ]]; then
+        cmd="bun run gateway:dev"
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: $cmd"
+        return
+    fi
+
+    if [[ "$BACKGROUND" == "true" ]]; then
+        $cmd > "${PID_DIR}/gateway.log" 2>&1 &
+        save_pid "gateway" $!
+        log success "Gateway started in background (PID: $!)"
+    else
+        $cmd &
+        save_pid "gateway" $!
+        log success "Gateway started (PID: $!)"
+    fi
+}
+
+start_webclient() {
+    log info "Starting webclient watcher..."
+
+    cd "${PROJECT_ROOT}/webclient"
+
+    local cmd="bun run watch"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: $cmd"
+        return
+    fi
+
+    if [[ "$BACKGROUND" == "true" ]]; then
+        $cmd > "${PID_DIR}/webclient.log" 2>&1 &
+        save_pid "webclient" $!
+        log success "Webclient watcher started in background (PID: $!)"
+    else
+        $cmd &
+        save_pid "webclient" $!
+        log success "Webclient watcher started (PID: $!)"
+    fi
+}
+
+# =============================================================================
+# STATUS
+# =============================================================================
+
+show_status() {
+    log header "Component Status"
+
+    for name in engine gateway webclient; do
+        if is_running "$name"; then
+            local pid
+            pid=$(get_pid "$name")
+            echo -e "${GREEN}●${NC} ${BOLD}$name${NC} running (PID: $pid)"
+        else
+            echo -e "${RED}●${NC} ${BOLD}$name${NC} not running"
+        fi
+    done
+
+    echo ""
+
+    # Check ports
+    log info "Port status:"
+    for port in "$ENGINE_WEB_PORT" "$ENGINE_GAME_PORT" "$GATEWAY_PORT"; do
+        if command -v ss &> /dev/null; then
+            if ss -tuln | grep -q ":${port} "; then
+                echo -e "  ${GREEN}●${NC} Port $port in use"
+            else
+                echo -e "  ${DIM}○${NC} Port $port available"
+            fi
+        fi
+    done
+}
+
+# =============================================================================
+# STOP
+# =============================================================================
+
+stop_all() {
+    log header "Stopping All Components"
+
+    for name in engine gateway webclient; do
+        if is_running "$name"; then
+            local pid
+            pid=$(get_pid "$name")
+            log info "Stopping $name (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            rm -f "${PID_DIR}/${name}.pid"
+            log success "$name stopped"
+        else
+            log debug "$name not running"
+        fi
+    done
+}
+
+# =============================================================================
+# LOGS
+# =============================================================================
+
+show_logs() {
+    log header "Logs"
+
+    if [[ ! -d "$PID_DIR" ]]; then
+        log warn "No logs found"
+        return
+    fi
+
+    for name in engine gateway webclient; do
+        local log_file="${PID_DIR}/${name}.log"
+        if [[ -f "$log_file" ]]; then
+            echo -e "\n${BOLD}=== $name ===${NC}"
+            tail -20 "$log_file"
+        fi
+    done
+}
+
+# =============================================================================
+# BOT
+# =============================================================================
+
+create_bot() {
+    if [[ -z "$DEFAULT_BOT_NAME" ]]; then
+        log error "Bot name required. Use --bot-name NAME"
+        exit 1
+    fi
+
+    log header "Creating Bot: $DEFAULT_BOT_NAME"
+
+    cd "${PROJECT_ROOT}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would create bot: $DEFAULT_BOT_NAME"
+        return
+    fi
+
+    bun scripts/create-bot.ts "$DEFAULT_BOT_NAME"
+
+    log success "Bot created: $DEFAULT_BOT_NAME"
+    log info "Run with: bun bots/${DEFAULT_BOT_NAME}/script.ts"
+}
+
+# =============================================================================
+# OPEN BROWSER
+# =============================================================================
+
+open_browser() {
+    if [[ "$OPEN_BROWSER" != "true" ]]; then
+        return
+    fi
+
+    log info "Opening browser..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would open: $BROWSER_URL"
+        return
+    fi
+
+    sleep "$STARTUP_DELAY"
+
+    if command -v xdg-open &> /dev/null; then
+        xdg-open "$BROWSER_URL" 2>/dev/null &
+    elif command -v open &> /dev/null; then
+        open "$BROWSER_URL" &
+    else
+        log warn "Could not detect browser opener"
+    fi
+}
+
+# =============================================================================
+# MAIN START
+# =============================================================================
+
+do_start() {
+    log header "Starting rs-sdk Local Server"
+
+    # Validate project root
+    if [[ ! -d "$PROJECT_ROOT" ]]; then
+        log error "Project root not found: $PROJECT_ROOT"
+        exit 1
+    fi
+
+    mkdir_pid_dir
+
+    # Kill existing if requested
+    if [[ "$KILL_EXISTING" == "true" ]]; then
+        kill_existing_processes
+    fi
+
+    # Setup Prisma for NixOS
+    setup_prisma_env
+
+    # Run migrations if requested
+    if [[ "$RUN_MIGRATIONS" == "true" ]]; then
+        run_migrations
+    fi
+
+    # Build if requested
+    if [[ "$BUILD_WEBCLIENT" == "true" ]]; then
+        build_webclient
+    fi
+
+    # Copy client files if requested
+    if [[ "$COPY_CLIENT_FILES" == "true" ]]; then
+        copy_client_files
+    fi
+
+    # Start components
+    if [[ "$START_ENGINE" == "true" ]]; then
+        start_engine
+        sleep "$STARTUP_DELAY"
+    fi
+
+    if [[ "$START_GATEWAY" == "true" ]]; then
+        start_gateway
+        sleep "$STARTUP_DELAY"
+    fi
+
+    if [[ "$START_WEBCLIENT" == "true" ]]; then
+        start_webclient
+    fi
+
+    # Open browser
+    open_browser
+
+    # Auto-start bot
+    if [[ "$AUTO_START_BOT" == "true" ]] && [[ -n "$DEFAULT_BOT_NAME" ]]; then
+        log info "Auto-starting bot: $DEFAULT_BOT_NAME"
+        sleep "$STARTUP_DELAY"
+        create_bot
+    fi
+
+    log success "Server started!"
+    echo ""
+    echo -e "${BOLD}URLs:${NC}"
+    echo -e "  Web client: ${CYAN}http://localhost:${ENGINE_WEB_PORT}${NC}"
+    echo -e "  Game port:  ${CYAN}localhost:${ENGINE_GAME_PORT}${NC}"
+    echo -e "  Gateway:    ${CYAN}ws://localhost:${GATEWAY_PORT}${NC}"
+    echo ""
+
+    if [[ "$BACKGROUND" != "true" ]]; then
+        log info "Press Ctrl+C to stop"
+        wait
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    # Load config first
+    load_config
+
+    # Parse command line args (override config)
+    parse_args "$@"
+
+    # Setup colors after parsing (in case --no-color was used)
+    setup_colors
+
+    # Dump config if requested
+    if [[ "$DUMP_CONFIG" == "true" ]]; then
+        dump_config
+        exit 0
+    fi
+
+    # Execute command
+    case "$COMMAND" in
+        start)
+            do_start
+            ;;
+        stop)
+            stop_all
+            ;;
+        restart)
+            stop_all
+            sleep 2
+            do_start
+            ;;
+        status)
+            show_status
+            ;;
+        logs)
+            show_logs
+            ;;
+        build)
+            build_webclient
+            ;;
+        migrate)
+            run_migrations
+            ;;
+        push-db)
+            push_database
+            ;;
+        reset-db)
+            reset_database
+            ;;
+        create-bot)
+            create_bot
+            ;;
+        *)
+            log error "Unknown command: $COMMAND"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

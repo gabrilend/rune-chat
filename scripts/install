@@ -1,0 +1,1255 @@
+#!/usr/bin/env bash
+#
+# rs-sdk installation script
+# Sets up the RuneScape SDK development environment
+#
+
+set -e
+
+# =============================================================================
+# LOCAL ENVIRONMENT SETUP
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIBS_ENV="${SCRIPT_DIR}/../libs/env.sh"
+
+# Source local dependencies environment if available
+if [[ -f "$LIBS_ENV" ]]; then
+    source "$LIBS_ENV" 2>/dev/null || true
+fi
+
+# =============================================================================
+# DEFAULTS (overridden by config file, then by command line flags)
+# =============================================================================
+
+PROJECT_ROOT="/home/ritz/programming/ai-stuff/runescape/rs-sdk"
+REPO_URL="https://github.com/MaxBittker/rs-sdk.git"
+INSTALL_ROOT_DEPS=true
+INSTALL_ENGINE_DEPS=true
+INSTALL_WEBCLIENT_DEPS=true
+INSTALL_GATEWAY_DEPS=true
+BUILD_ENGINE_CONTENT=true
+BUILD_WEBCLIENT=true
+COPY_WEBCLIENT_ASSETS=true
+RUN_MIGRATIONS=true
+DB_BACKEND=sqlite
+CREATE_DIRECTORIES=true
+CREATE_ENGINE_ENV=true
+NIXOS_PRISMA_COMPAT=true
+PRISMA_IGNORE_CHECKSUM=true
+CLONE_IF_MISSING=true
+GIT_BRANCH="main"
+VERIFY_JAVA=true
+VERIFY_BUN=true
+VERIFY_PRISMA_ENGINES=true
+LOG_LEVEL=info
+COLOR_OUTPUT=true
+VERBOSE=false
+QUIET=false
+LOG_FILE=""
+
+# =============================================================================
+# STATE TRACKING (for update script integration)
+# =============================================================================
+
+declare -A INSTALL_STATUS
+ERRORS=()
+
+# =============================================================================
+# COLOR DEFINITIONS
+# =============================================================================
+
+setup_colors() {
+    if [[ "$COLOR_OUTPUT" == "true" ]] && [[ -t 1 ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        BOLD='\033[1m'
+        DIM='\033[2m'
+        NC='\033[0m'
+    else
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BLUE=''
+        MAGENTA=''
+        CYAN=''
+        BOLD=''
+        DIM=''
+        NC=''
+    fi
+}
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+
+    [[ "$QUIET" == "true" ]] && [[ "$level" != "error" ]] && return
+
+    case "$level" in
+        debug)
+            [[ "$VERBOSE" != "true" ]] && return
+            echo -e "${DIM}[$timestamp]${NC} ${CYAN}[DEBUG]${NC} $message"
+            ;;
+        info)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}[INFO]${NC} $message"
+            ;;
+        warn)
+            echo -e "${DIM}[$timestamp]${NC} ${YELLOW}[WARN]${NC} $message"
+            ;;
+        error)
+            echo -e "${DIM}[$timestamp]${NC} ${RED}[ERROR]${NC} $message" >&2
+            ;;
+        success)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}${BOLD}[OK]${NC} $message"
+            ;;
+        header)
+            echo -e "\n${BOLD}${BLUE}=== $message ===${NC}\n"
+            ;;
+        step)
+            echo -e "${BOLD}${MAGENTA}>>>${NC} $message"
+            ;;
+    esac
+
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
+}
+
+# =============================================================================
+# CONFIG FILE LOADING
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/../config/install.conf"
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log debug "Loading config from $CONFIG_FILE"
+        while IFS='=' read -r key value; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+            if [[ -n "$key" ]] && [[ -n "$value" ]]; then
+                export "$key"="$value"
+            fi
+        done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep '=')
+    fi
+}
+
+# =============================================================================
+# USAGE / HELP
+# =============================================================================
+
+show_help() {
+    cat << EOF
+${BOLD}rs-sdk installation script${NC}
+
+${BOLD}USAGE:${NC}
+    $(basename "$0") [OPTIONS] [COMMAND]
+
+${BOLD}COMMANDS:${NC}
+    full            Full installation (default)
+    deps            Install dependencies only
+    build           Build components only
+    migrate         Run database migrations only
+    verify          Verify prerequisites only
+    clean           Clean build artifacts
+    status          Show installation status
+
+${BOLD}COMPONENT SELECTION:${NC}
+    --all                       Install/build everything (default)
+    --deps-only                 Only install dependencies
+    --build-only                Only build components
+    --no-deps                   Skip dependency installation
+    --no-build                  Skip building
+
+${BOLD}DEPENDENCY OPTIONS:${NC}
+    --root-deps                 Install root dependencies
+    --no-root-deps              Skip root dependencies
+    --engine-deps               Install engine dependencies
+    --no-engine-deps            Skip engine dependencies
+    --webclient-deps            Install webclient dependencies
+    --no-webclient-deps         Skip webclient dependencies
+    --gateway-deps              Install gateway dependencies
+    --no-gateway-deps           Skip gateway dependencies
+
+${BOLD}BUILD OPTIONS:${NC}
+    --engine-content            Build engine content/cache
+    --no-engine-content         Skip engine content build
+    --webclient                 Build webclient bundles
+    --no-webclient              Skip webclient build
+    --copy-assets               Copy webclient to engine
+    --no-copy-assets            Skip copying webclient assets
+
+${BOLD}DATABASE OPTIONS:${NC}
+    --migrate                   Run database migrations
+    --no-migrate                Skip migrations
+    --db-backend BACKEND        Database backend: sqlite|mysql
+
+${BOLD}SETUP OPTIONS:${NC}
+    --create-dirs               Create required directories
+    --no-create-dirs            Skip directory creation
+    --create-env                Create engine .env file
+    --no-create-env             Skip .env creation
+    --clone                     Clone repo if missing
+    --no-clone                  Don't clone repo
+
+${BOLD}NIXOS OPTIONS:${NC}
+    --nixos-compat              Enable NixOS Prisma compatibility
+    --no-nixos-compat           Disable NixOS Prisma compatibility
+    --prisma-ignore-checksum    Ignore Prisma checksum errors
+    --no-prisma-ignore-checksum Require Prisma checksum validation
+
+${BOLD}VERIFICATION OPTIONS:${NC}
+    --verify-java               Verify Java installation
+    --no-verify-java            Skip Java verification
+    --verify-bun                Verify Bun installation
+    --no-verify-bun             Skip Bun verification
+    --verify-prisma             Verify Prisma engines (NixOS)
+    --no-verify-prisma          Skip Prisma verification
+
+${BOLD}OUTPUT OPTIONS:${NC}
+    -v, --verbose               Verbose output
+    -q, --quiet                 Quiet mode (errors only)
+    --log-level LEVEL           Log level: debug|info|warn|error
+    --log-file FILE             Log to file
+    --no-color                  Disable colored output
+    --color                     Enable colored output
+
+${BOLD}PATH OPTIONS:${NC}
+    --project-root DIR          Project root directory
+    --repo-url URL              Git repository URL
+    --branch BRANCH             Git branch to use
+    --config FILE               Config file path
+
+${BOLD}OTHER OPTIONS:${NC}
+    -h, --help                  Show this help message
+    --version                   Show version
+    --dry-run                   Show what would be done
+    --dump-config               Dump current configuration
+    -y, --yes                   Skip confirmation prompts
+
+${BOLD}EXAMPLES:${NC}
+    $(basename "$0")                        # Full installation
+    $(basename "$0") deps                   # Dependencies only
+    $(basename "$0") build                  # Build only
+    $(basename "$0") --no-engine-content    # Skip engine build
+    $(basename "$0") --deps-only -v         # Deps only, verbose
+    $(basename "$0") verify                 # Check prerequisites
+    $(basename "$0") status                 # Show what's installed
+
+EOF
+}
+
+show_version() {
+    echo "rs-sdk installer v1.0.0"
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+COMMAND="full"
+DRY_RUN=false
+DUMP_CONFIG=false
+SKIP_CONFIRM=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # Commands
+            full|deps|build|migrate|verify|clean|status)
+                COMMAND="$1"
+                shift
+                ;;
+
+            # Component selection
+            --all)
+                INSTALL_ROOT_DEPS=true
+                INSTALL_ENGINE_DEPS=true
+                INSTALL_WEBCLIENT_DEPS=true
+                INSTALL_GATEWAY_DEPS=true
+                BUILD_ENGINE_CONTENT=true
+                BUILD_WEBCLIENT=true
+                COPY_WEBCLIENT_ASSETS=true
+                RUN_MIGRATIONS=true
+                shift
+                ;;
+            --deps-only)
+                BUILD_ENGINE_CONTENT=false
+                BUILD_WEBCLIENT=false
+                COPY_WEBCLIENT_ASSETS=false
+                shift
+                ;;
+            --build-only)
+                INSTALL_ROOT_DEPS=false
+                INSTALL_ENGINE_DEPS=false
+                INSTALL_WEBCLIENT_DEPS=false
+                INSTALL_GATEWAY_DEPS=false
+                RUN_MIGRATIONS=false
+                shift
+                ;;
+            --no-deps)
+                INSTALL_ROOT_DEPS=false
+                INSTALL_ENGINE_DEPS=false
+                INSTALL_WEBCLIENT_DEPS=false
+                INSTALL_GATEWAY_DEPS=false
+                shift
+                ;;
+            --no-build)
+                BUILD_ENGINE_CONTENT=false
+                BUILD_WEBCLIENT=false
+                COPY_WEBCLIENT_ASSETS=false
+                shift
+                ;;
+
+            # Dependency options
+            --root-deps) INSTALL_ROOT_DEPS=true; shift ;;
+            --no-root-deps) INSTALL_ROOT_DEPS=false; shift ;;
+            --engine-deps) INSTALL_ENGINE_DEPS=true; shift ;;
+            --no-engine-deps) INSTALL_ENGINE_DEPS=false; shift ;;
+            --webclient-deps) INSTALL_WEBCLIENT_DEPS=true; shift ;;
+            --no-webclient-deps) INSTALL_WEBCLIENT_DEPS=false; shift ;;
+            --gateway-deps) INSTALL_GATEWAY_DEPS=true; shift ;;
+            --no-gateway-deps) INSTALL_GATEWAY_DEPS=false; shift ;;
+
+            # Build options
+            --engine-content) BUILD_ENGINE_CONTENT=true; shift ;;
+            --no-engine-content) BUILD_ENGINE_CONTENT=false; shift ;;
+            --webclient) BUILD_WEBCLIENT=true; shift ;;
+            --no-webclient) BUILD_WEBCLIENT=false; shift ;;
+            --copy-assets) COPY_WEBCLIENT_ASSETS=true; shift ;;
+            --no-copy-assets) COPY_WEBCLIENT_ASSETS=false; shift ;;
+
+            # Database options
+            --migrate) RUN_MIGRATIONS=true; shift ;;
+            --no-migrate) RUN_MIGRATIONS=false; shift ;;
+            --db-backend) DB_BACKEND="$2"; shift 2 ;;
+
+            # Setup options
+            --create-dirs) CREATE_DIRECTORIES=true; shift ;;
+            --no-create-dirs) CREATE_DIRECTORIES=false; shift ;;
+            --create-env) CREATE_ENGINE_ENV=true; shift ;;
+            --no-create-env) CREATE_ENGINE_ENV=false; shift ;;
+            --clone) CLONE_IF_MISSING=true; shift ;;
+            --no-clone) CLONE_IF_MISSING=false; shift ;;
+
+            # NixOS options
+            --nixos-compat) NIXOS_PRISMA_COMPAT=true; shift ;;
+            --no-nixos-compat) NIXOS_PRISMA_COMPAT=false; shift ;;
+            --prisma-ignore-checksum) PRISMA_IGNORE_CHECKSUM=true; shift ;;
+            --no-prisma-ignore-checksum) PRISMA_IGNORE_CHECKSUM=false; shift ;;
+
+            # Verification options
+            --verify-java) VERIFY_JAVA=true; shift ;;
+            --no-verify-java) VERIFY_JAVA=false; shift ;;
+            --verify-bun) VERIFY_BUN=true; shift ;;
+            --no-verify-bun) VERIFY_BUN=false; shift ;;
+            --verify-prisma) VERIFY_PRISMA_ENGINES=true; shift ;;
+            --no-verify-prisma) VERIFY_PRISMA_ENGINES=false; shift ;;
+
+            # Output options
+            -v|--verbose) VERBOSE=true; shift ;;
+            -q|--quiet) QUIET=true; shift ;;
+            --log-level) LOG_LEVEL="$2"; shift 2 ;;
+            --log-file) LOG_FILE="$2"; shift 2 ;;
+            --no-color) COLOR_OUTPUT=false; shift ;;
+            --color) COLOR_OUTPUT=true; shift ;;
+
+            # Path options
+            --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+            --repo-url) REPO_URL="$2"; shift 2 ;;
+            --branch) GIT_BRANCH="$2"; shift 2 ;;
+            --config)
+                CONFIG_FILE="$2"
+                load_config
+                shift 2
+                ;;
+
+            # Other options
+            -h|--help) show_help; exit 0 ;;
+            --version) show_version; exit 0 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --dump-config) DUMP_CONFIG=true; shift ;;
+            -y|--yes) SKIP_CONFIRM=true; shift ;;
+
+            -*)
+                log error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                log error "Unknown argument: $1"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# CONFIGURATION DUMP
+# =============================================================================
+
+dump_config() {
+    cat << EOF
+${BOLD}Current Configuration:${NC}
+
+${CYAN}Paths:${NC}
+  PROJECT_ROOT=${PROJECT_ROOT}
+  REPO_URL=${REPO_URL}
+  GIT_BRANCH=${GIT_BRANCH}
+
+${CYAN}Dependencies:${NC}
+  INSTALL_ROOT_DEPS=${INSTALL_ROOT_DEPS}
+  INSTALL_ENGINE_DEPS=${INSTALL_ENGINE_DEPS}
+  INSTALL_WEBCLIENT_DEPS=${INSTALL_WEBCLIENT_DEPS}
+  INSTALL_GATEWAY_DEPS=${INSTALL_GATEWAY_DEPS}
+
+${CYAN}Build:${NC}
+  BUILD_ENGINE_CONTENT=${BUILD_ENGINE_CONTENT}
+  BUILD_WEBCLIENT=${BUILD_WEBCLIENT}
+  COPY_WEBCLIENT_ASSETS=${COPY_WEBCLIENT_ASSETS}
+
+${CYAN}Database:${NC}
+  RUN_MIGRATIONS=${RUN_MIGRATIONS}
+  DB_BACKEND=${DB_BACKEND}
+
+${CYAN}Setup:${NC}
+  CREATE_DIRECTORIES=${CREATE_DIRECTORIES}
+  CREATE_ENGINE_ENV=${CREATE_ENGINE_ENV}
+  CLONE_IF_MISSING=${CLONE_IF_MISSING}
+
+${CYAN}NixOS:${NC}
+  NIXOS_PRISMA_COMPAT=${NIXOS_PRISMA_COMPAT}
+  PRISMA_IGNORE_CHECKSUM=${PRISMA_IGNORE_CHECKSUM}
+
+${CYAN}Verification:${NC}
+  VERIFY_JAVA=${VERIFY_JAVA}
+  VERIFY_BUN=${VERIFY_BUN}
+  VERIFY_PRISMA_ENGINES=${VERIFY_PRISMA_ENGINES}
+EOF
+}
+
+# =============================================================================
+# VERIFICATION FUNCTIONS
+# =============================================================================
+
+verify_bun() {
+    log step "Checking Bun installation..."
+    if command -v bun &> /dev/null; then
+        local version
+        version=$(bun --version 2>/dev/null || echo "unknown")
+        log success "Bun found: v${version}"
+        INSTALL_STATUS[bun]="installed:${version}"
+        return 0
+    else
+        log error "Bun not found. Please install Bun: https://bun.sh"
+        INSTALL_STATUS[bun]="missing"
+        ERRORS+=("Bun not installed")
+        return 1
+    fi
+}
+
+verify_java() {
+    log step "Checking Java installation..."
+    if command -v java &> /dev/null; then
+        local version
+        version=$(java -version 2>&1 | head -1 | cut -d'"' -f2 || echo "unknown")
+        log success "Java found: ${version}"
+        INSTALL_STATUS[java]="installed:${version}"
+        return 0
+    else
+        log error "Java not found. Please install Java (JDK 11+)"
+        INSTALL_STATUS[java]="missing"
+        ERRORS+=("Java not installed")
+        return 1
+    fi
+}
+
+verify_prisma_engines() {
+    if [[ "$NIXOS_PRISMA_COMPAT" != "true" ]]; then
+        log debug "Skipping Prisma engines check (NixOS compat disabled)"
+        return 0
+    fi
+
+    log step "Checking Prisma engines..."
+
+    local local_prisma="${SCRIPT_DIR}/../libs/prisma-engines"
+    local found=true
+    local source=""
+
+    # Check local libs first, then system
+    if [[ -x "${local_prisma}/schema-engine" ]]; then
+        log debug "schema-engine found: ${local_prisma}/schema-engine (local)"
+        source="local"
+    elif command -v schema-engine &> /dev/null; then
+        log debug "schema-engine found: $(which schema-engine) (system)"
+        source="system"
+    else
+        log warn "schema-engine not found"
+        found=false
+    fi
+
+    if [[ -x "${local_prisma}/query-engine" ]]; then
+        log debug "query-engine found: ${local_prisma}/query-engine (local)"
+    elif command -v query-engine &> /dev/null; then
+        log debug "query-engine found: $(which query-engine) (system)"
+    else
+        log warn "query-engine not found"
+        found=false
+    fi
+
+    if [[ -f "${local_prisma}/libquery_engine.node" ]]; then
+        log debug "libquery_engine.node found: ${local_prisma}/libquery_engine.node (local)"
+    else
+        log debug "libquery_engine.node not found locally"
+    fi
+
+    if [[ "$found" == "true" ]]; then
+        log success "Prisma engines found (${source})"
+        INSTALL_STATUS[prisma_engines]="installed:${source}"
+        return 0
+    else
+        log warn "Prisma engines not found. Run: ./build-deps prisma"
+        INSTALL_STATUS[prisma_engines]="missing"
+        return 1
+    fi
+}
+
+verify_git() {
+    log step "Checking Git installation..."
+    if command -v git &> /dev/null; then
+        local version
+        version=$(git --version | cut -d' ' -f3)
+        log success "Git found: v${version}"
+        INSTALL_STATUS[git]="installed:${version}"
+        return 0
+    else
+        log error "Git not found"
+        INSTALL_STATUS[git]="missing"
+        ERRORS+=("Git not installed")
+        return 1
+    fi
+}
+
+verify_all() {
+    log header "Verifying Prerequisites"
+
+    local all_ok=true
+
+    verify_git || all_ok=false
+
+    if [[ "$VERIFY_BUN" == "true" ]]; then
+        verify_bun || all_ok=false
+    fi
+
+    if [[ "$VERIFY_JAVA" == "true" ]]; then
+        verify_java || all_ok=false
+    fi
+
+    if [[ "$VERIFY_PRISMA_ENGINES" == "true" ]]; then
+        verify_prisma_engines || true  # Non-fatal
+    fi
+
+    if [[ "$all_ok" == "true" ]]; then
+        log success "All prerequisites satisfied"
+        return 0
+    else
+        log error "Some prerequisites missing"
+        return 1
+    fi
+}
+
+# =============================================================================
+# PRISMA ENVIRONMENT SETUP
+# =============================================================================
+
+setup_prisma_env() {
+    if [[ "$NIXOS_PRISMA_COMPAT" != "true" ]]; then
+        return
+    fi
+
+    log debug "Setting up Prisma environment"
+
+    # Local libs directory (built from source)
+    local local_prisma="${SCRIPT_DIR}/../libs/prisma-engines"
+
+    # Prefer locally built Prisma engines
+    if [[ -x "${local_prisma}/schema-engine" ]]; then
+        export PRISMA_SCHEMA_ENGINE_BINARY="${local_prisma}/schema-engine"
+        log debug "Using local schema-engine"
+    elif command -v schema-engine &> /dev/null; then
+        export PRISMA_SCHEMA_ENGINE_BINARY=$(which schema-engine)
+        log debug "Using system schema-engine"
+    fi
+
+    if [[ -x "${local_prisma}/query-engine" ]]; then
+        export PRISMA_QUERY_ENGINE_BINARY="${local_prisma}/query-engine"
+        log debug "Using local query-engine"
+    elif command -v query-engine &> /dev/null; then
+        export PRISMA_QUERY_ENGINE_BINARY=$(which query-engine)
+        log debug "Using system query-engine"
+    fi
+
+    if [[ -f "${local_prisma}/libquery_engine.node" ]]; then
+        export PRISMA_QUERY_ENGINE_LIBRARY="${local_prisma}/libquery_engine.node"
+        log debug "Using local libquery_engine.node"
+    elif command -v query-engine &> /dev/null; then
+        local engine_dir
+        engine_dir=$(dirname "$(which query-engine)")
+        local lib_path="${engine_dir}/../lib/libquery_engine.node"
+        if [[ -f "$lib_path" ]]; then
+            export PRISMA_QUERY_ENGINE_LIBRARY="$lib_path"
+            log debug "Using system libquery_engine.node"
+        fi
+    fi
+
+    if command -v prisma-fmt &> /dev/null; then
+        export PRISMA_FMT_BINARY=$(which prisma-fmt)
+    fi
+
+    if [[ "$PRISMA_IGNORE_CHECKSUM" == "true" ]]; then
+        export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
+    fi
+
+    # Log what we're using
+    log debug "PRISMA_SCHEMA_ENGINE_BINARY=${PRISMA_SCHEMA_ENGINE_BINARY:-not set}"
+    log debug "PRISMA_QUERY_ENGINE_BINARY=${PRISMA_QUERY_ENGINE_BINARY:-not set}"
+    log debug "PRISMA_QUERY_ENGINE_LIBRARY=${PRISMA_QUERY_ENGINE_LIBRARY:-not set}"
+}
+
+# =============================================================================
+# CLONE REPOSITORY
+# =============================================================================
+
+clone_repo() {
+    if [[ -d "$PROJECT_ROOT/.git" ]]; then
+        log info "Repository already exists at $PROJECT_ROOT"
+        INSTALL_STATUS[repo]="exists"
+        return 0
+    fi
+
+    if [[ "$CLONE_IF_MISSING" != "true" ]]; then
+        log error "Repository not found and cloning disabled"
+        return 1
+    fi
+
+    log step "Cloning repository..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would clone $REPO_URL to $PROJECT_ROOT"
+        return 0
+    fi
+
+    local parent_dir
+    parent_dir=$(dirname "$PROJECT_ROOT")
+    mkdir -p "$parent_dir"
+
+    git clone --branch "$GIT_BRANCH" "$REPO_URL" "$PROJECT_ROOT"
+
+    log success "Repository cloned"
+    INSTALL_STATUS[repo]="cloned"
+}
+
+# =============================================================================
+# CREATE DIRECTORIES
+# =============================================================================
+
+create_directories() {
+    if [[ "$CREATE_DIRECTORIES" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Creating required directories..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would create directories"
+        return 0
+    fi
+
+    mkdir -p "${PROJECT_ROOT}/engine/data/pack/client"
+    mkdir -p "${PROJECT_ROOT}/engine/data/pack/server"
+    mkdir -p "${PROJECT_ROOT}/engine/public/client"
+    mkdir -p "${PROJECT_ROOT}/engine/public/bot"
+
+    log success "Directories created"
+    INSTALL_STATUS[directories]="created"
+}
+
+# =============================================================================
+# CREATE ENGINE .ENV
+# =============================================================================
+
+create_engine_env() {
+    if [[ "$CREATE_ENGINE_ENV" != "true" ]]; then
+        return 0
+    fi
+
+    local env_file="${PROJECT_ROOT}/engine/.env"
+    local example_file="${PROJECT_ROOT}/engine/.env.example"
+
+    if [[ -f "$env_file" ]]; then
+        log info "Engine .env file already exists"
+        INSTALL_STATUS[engine_env]="exists"
+        return 0
+    fi
+
+    if [[ ! -f "$example_file" ]]; then
+        log warn "No .env.example found"
+        return 0
+    fi
+
+    log step "Creating engine .env file..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would create .env from .env.example"
+        return 0
+    fi
+
+    cp "$example_file" "$env_file"
+
+    log success "Engine .env created"
+    INSTALL_STATUS[engine_env]="created"
+}
+
+# =============================================================================
+# INSTALL DEPENDENCIES
+# =============================================================================
+
+install_root_deps() {
+    if [[ "$INSTALL_ROOT_DEPS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Installing root dependencies..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun install (root)"
+        return 0
+    fi
+
+    cd "$PROJECT_ROOT"
+    bun install
+
+    log success "Root dependencies installed"
+    INSTALL_STATUS[root_deps]="installed"
+}
+
+install_engine_deps() {
+    if [[ "$INSTALL_ENGINE_DEPS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Installing engine dependencies..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun install (engine)"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+    bun install
+
+    log success "Engine dependencies installed"
+    INSTALL_STATUS[engine_deps]="installed"
+}
+
+install_webclient_deps() {
+    if [[ "$INSTALL_WEBCLIENT_DEPS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Installing webclient dependencies..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun install (webclient)"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/webclient"
+    bun install
+
+    log success "Webclient dependencies installed"
+    INSTALL_STATUS[webclient_deps]="installed"
+}
+
+install_gateway_deps() {
+    if [[ "$INSTALL_GATEWAY_DEPS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Installing gateway dependencies..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun install (gateway)"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/gateway"
+    bun install
+
+    log success "Gateway dependencies installed"
+    INSTALL_STATUS[gateway_deps]="installed"
+}
+
+install_all_deps() {
+    log header "Installing Dependencies"
+
+    install_root_deps
+    install_engine_deps
+    install_webclient_deps
+    install_gateway_deps
+}
+
+# =============================================================================
+# RUN MIGRATIONS
+# =============================================================================
+
+run_migrations() {
+    if [[ "$RUN_MIGRATIONS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Running database migrations..."
+
+    setup_prisma_env
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run migrations"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+
+    if [[ "$DB_BACKEND" == "sqlite" ]]; then
+        bun run sqlite:migrate
+    else
+        bun run db:migrate
+    fi
+
+    log success "Migrations complete"
+    INSTALL_STATUS[migrations]="complete"
+}
+
+# =============================================================================
+# BUILD FUNCTIONS
+# =============================================================================
+
+build_engine_content() {
+    if [[ "$BUILD_ENGINE_CONTENT" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Building engine content..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun run build (engine)"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+    bun run build
+
+    log success "Engine content built"
+    INSTALL_STATUS[engine_content]="built"
+}
+
+build_webclient() {
+    if [[ "$BUILD_WEBCLIENT" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Building webclient..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun run build (webclient)"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/webclient"
+    bun run build
+
+    log success "Webclient built"
+    INSTALL_STATUS[webclient]="built"
+}
+
+copy_webclient_assets() {
+    if [[ "$COPY_WEBCLIENT_ASSETS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Copying webclient assets to engine..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would copy webclient assets"
+        return 0
+    fi
+
+    mkdir -p "${PROJECT_ROOT}/engine/public/client"
+    mkdir -p "${PROJECT_ROOT}/engine/public/bot"
+
+    cp "${PROJECT_ROOT}/webclient/out/standard/client.js" "${PROJECT_ROOT}/engine/public/client/"
+    cp "${PROJECT_ROOT}/webclient/out/bot/client.js" "${PROJECT_ROOT}/engine/public/bot/"
+
+    log success "Webclient assets copied"
+    INSTALL_STATUS[webclient_assets]="copied"
+}
+
+build_all() {
+    log header "Building Components"
+
+    build_engine_content
+    build_webclient
+    copy_webclient_assets
+}
+
+# =============================================================================
+# CLEAN
+# =============================================================================
+
+clean_build() {
+    log header "Cleaning Build Artifacts"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would clean build artifacts"
+        return 0
+    fi
+
+    # Engine pack files
+    rm -rf "${PROJECT_ROOT}/engine/data/pack"/*
+    mkdir -p "${PROJECT_ROOT}/engine/data/pack/client"
+    mkdir -p "${PROJECT_ROOT}/engine/data/pack/server"
+
+    # Webclient output
+    rm -rf "${PROJECT_ROOT}/webclient/out"
+
+    # Engine public client files
+    rm -f "${PROJECT_ROOT}/engine/public/client/client.js"
+    rm -f "${PROJECT_ROOT}/engine/public/bot/client.js"
+
+    log success "Build artifacts cleaned"
+}
+
+# =============================================================================
+# STATUS
+# =============================================================================
+
+check_file_exists() {
+    local path="$1"
+    local name="$2"
+    local min_size="${3:-0}"  # Optional minimum size in bytes
+
+    if [[ ! -e "$path" ]]; then
+        echo -e "  ${RED}●${NC} $name ${DIM}(missing)${NC}"
+        return 1
+    fi
+
+    # For files, check size
+    if [[ -f "$path" ]]; then
+        local size
+        size=$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0)
+        if [[ "$size" -eq 0 ]]; then
+            echo -e "  ${YELLOW}●${NC} $name ${DIM}(empty)${NC}"
+            return 1
+        elif [[ "$min_size" -gt 0 ]] && [[ "$size" -lt "$min_size" ]]; then
+            echo -e "  ${YELLOW}●${NC} $name ${DIM}(incomplete: ${size} bytes)${NC}"
+            return 1
+        fi
+    fi
+
+    # For directories, check if non-empty
+    if [[ -d "$path" ]]; then
+        local count
+        count=$(find "$path" -type f 2>/dev/null | head -1 | wc -l)
+        if [[ "$count" -eq 0 ]]; then
+            echo -e "  ${YELLOW}●${NC} $name ${DIM}(empty dir)${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "  ${GREEN}●${NC} $name"
+    return 0
+}
+
+check_cache_valid() {
+    local cache_dir="${PROJECT_ROOT}/engine/data/pack"
+    local cache_file="${cache_dir}/main_file_cache.dat"
+
+    if [[ ! -f "$cache_file" ]]; then
+        echo -e "  ${RED}●${NC} Engine cache ${DIM}(missing)${NC}"
+        return 1
+    fi
+
+    local size
+    size=$(stat -c%s "$cache_file" 2>/dev/null || stat -f%z "$cache_file" 2>/dev/null || echo 0)
+
+    if [[ "$size" -lt 1000 ]]; then
+        echo -e "  ${RED}●${NC} Engine cache ${DIM}(not built - run: cd engine && bun run build)${NC}"
+        return 1
+    fi
+
+    echo -e "  ${GREEN}●${NC} Engine cache ($(numfmt --to=iec $size 2>/dev/null || echo "${size} bytes"))"
+    return 0
+}
+
+show_status() {
+    # Disable exit on error for status checks
+    set +e
+
+    log header "Installation Status"
+
+    echo -e "${BOLD}Prerequisites:${NC}"
+    command -v bun &>/dev/null && echo -e "  ${GREEN}●${NC} Bun" || echo -e "  ${RED}●${NC} Bun ${DIM}(missing)${NC}"
+    command -v java &>/dev/null && echo -e "  ${GREEN}●${NC} Java" || echo -e "  ${RED}●${NC} Java ${DIM}(missing)${NC}"
+    command -v git &>/dev/null && echo -e "  ${GREEN}●${NC} Git" || echo -e "  ${RED}●${NC} Git ${DIM}(missing)${NC}"
+
+    # Check Prisma engines - local libs first, then system
+    local local_prisma="${SCRIPT_DIR}/../libs/prisma-engines"
+    if [[ -x "${local_prisma}/schema-engine" ]]; then
+        echo -e "  ${GREEN}●${NC} Prisma engines ${DIM}(local)${NC}"
+    elif command -v schema-engine &>/dev/null; then
+        echo -e "  ${GREEN}●${NC} Prisma engines ${DIM}(system)${NC}"
+    else
+        echo -e "  ${YELLOW}●${NC} Prisma engines ${DIM}(run: ./build-deps prisma)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Repository:${NC}"
+    check_file_exists "${PROJECT_ROOT}/.git" "Git repository"
+    check_file_exists "${PROJECT_ROOT}/package.json" "Root package.json"
+
+    echo ""
+    echo -e "${BOLD}Dependencies (node_modules):${NC}"
+    check_file_exists "${PROJECT_ROOT}/node_modules" "Root"
+    check_file_exists "${PROJECT_ROOT}/engine/node_modules" "Engine"
+    check_file_exists "${PROJECT_ROOT}/webclient/node_modules" "Webclient"
+    check_file_exists "${PROJECT_ROOT}/gateway/node_modules" "Gateway"
+
+    echo ""
+    echo -e "${BOLD}Engine:${NC}"
+    check_file_exists "${PROJECT_ROOT}/engine/.env" ".env file"
+    check_file_exists "${PROJECT_ROOT}/engine/db.sqlite" "SQLite database" 1000
+    check_file_exists "${PROJECT_ROOT}/engine/RuneScriptCompiler.jar" "RuneScript compiler" 1000000
+    check_cache_valid
+
+    echo ""
+    echo -e "${BOLD}Webclient:${NC}"
+    check_file_exists "${PROJECT_ROOT}/webclient/out/standard/client.js" "Standard client build" 10000
+    check_file_exists "${PROJECT_ROOT}/webclient/out/bot/client.js" "Bot client build" 10000
+
+    echo ""
+    echo -e "${BOLD}Engine Public Assets:${NC}"
+    check_file_exists "${PROJECT_ROOT}/engine/public/client/client.js" "Standard client" 10000
+    check_file_exists "${PROJECT_ROOT}/engine/public/bot/client.js" "Bot client" 10000
+
+    echo ""
+    echo -e "${BOLD}Content:${NC}"
+    check_file_exists "${PROJECT_ROOT}/content/pack" "Content pack directory"
+    check_file_exists "${PROJECT_ROOT}/content/scripts" "Content scripts"
+
+    echo ""
+    echo -e "${BOLD}Local Dependencies (libs/):${NC}"
+    local libs_dir="${SCRIPT_DIR}/../libs"
+
+    # Check OpenSSL - supports both lib and lib64
+    if [[ -f "${libs_dir}/openssl/lib64/libssl.so" ]] || [[ -f "${libs_dir}/openssl/lib/libssl.so" ]]; then
+        local ssl_version=""
+        [[ -f "${libs_dir}/openssl/VERSION" ]] && ssl_version=" v$(cat "${libs_dir}/openssl/VERSION")"
+        echo -e "  ${GREEN}●${NC} OpenSSL${ssl_version}"
+    elif [[ -f "${libs_dir}/openssl/lib64/libssl.a" ]] || [[ -f "${libs_dir}/openssl/lib/libssl.a" ]]; then
+        local ssl_version=""
+        [[ -f "${libs_dir}/openssl/VERSION" ]] && ssl_version=" v$(cat "${libs_dir}/openssl/VERSION")"
+        echo -e "  ${GREEN}●${NC} OpenSSL${ssl_version} ${DIM}(static)${NC}"
+    else
+        echo -e "  ${YELLOW}●${NC} OpenSSL ${DIM}(run: ./build-deps openssl)${NC}"
+    fi
+
+    # Check Prisma engines
+    if [[ -x "${libs_dir}/prisma-engines/schema-engine" ]]; then
+        local prisma_version=""
+        [[ -f "${libs_dir}/prisma-engines/VERSION" ]] && prisma_version=" v$(cat "${libs_dir}/prisma-engines/VERSION")"
+        echo -e "  ${GREEN}●${NC} Prisma engines${prisma_version}"
+    else
+        echo -e "  ${YELLOW}●${NC} Prisma engines ${DIM}(run: ./build-deps prisma)${NC}"
+    fi
+
+    # Check env.sh
+    if [[ -f "${libs_dir}/env.sh" ]]; then
+        echo -e "  ${GREEN}●${NC} Environment script (env.sh)"
+    else
+        echo -e "  ${YELLOW}●${NC} Environment script ${DIM}(run: ./build-deps env)${NC}"
+    fi
+
+    # Check chatbot library
+    if [[ -f "${libs_dir}/chatbot/chatbot.lua" ]]; then
+        local sync_info=""
+        if [[ -f "${libs_dir}/chatbot/VERSION" ]]; then
+            local sync_time
+            sync_time=$(grep "synced=" "${libs_dir}/chatbot/VERSION" 2>/dev/null | cut -d= -f2 | cut -dT -f1)
+            [[ -n "$sync_time" ]] && sync_info=" ${DIM}(synced: ${sync_time})${NC}"
+        fi
+        echo -e "  ${GREEN}●${NC} Chatbot library${sync_info}"
+    else
+        echo -e "  ${YELLOW}●${NC} Chatbot library ${DIM}(run: ./build-deps chatbot)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Summary:${NC}"
+    local issues=0
+
+    # Check local dependencies (NixOS)
+    if [[ ! -x "${libs_dir}/prisma-engines/schema-engine" ]] && ! command -v schema-engine &>/dev/null; then
+        echo -e "  ${YELLOW}!${NC} Run: ./build-deps all ${DIM}(builds Prisma engines for NixOS)${NC}"
+        ((issues++)) || true
+    fi
+
+    # Check critical items
+    [[ ! -f "${PROJECT_ROOT}/engine/db.sqlite" ]] || [[ $(stat -c%s "${PROJECT_ROOT}/engine/db.sqlite" 2>/dev/null || echo 0) -lt 1000 ]] && {
+        echo -e "  ${YELLOW}!${NC} Run: ./install migrate"
+        ((issues++)) || true
+    }
+
+    local cache_size
+    cache_size=$(stat -c%s "${PROJECT_ROOT}/engine/data/pack/main_file_cache.dat" 2>/dev/null || echo 0)
+    [[ "$cache_size" -lt 1000 ]] && {
+        echo -e "  ${YELLOW}!${NC} Run: cd ${PROJECT_ROOT}/engine && bun run build"
+        ((issues++)) || true
+    }
+
+    [[ ! -f "${PROJECT_ROOT}/webclient/out/standard/client.js" ]] && {
+        echo -e "  ${YELLOW}!${NC} Run: ./install build --webclient"
+        ((issues++)) || true
+    }
+
+    [[ ! -f "${PROJECT_ROOT}/engine/public/client/client.js" ]] && {
+        echo -e "  ${YELLOW}!${NC} Run: ./install --copy-assets"
+        ((issues++)) || true
+    }
+
+    [[ "$issues" -eq 0 ]] && echo -e "  ${GREEN}✓${NC} All components ready"
+}
+
+# =============================================================================
+# MAIN FUNCTIONS
+# =============================================================================
+
+do_full_install() {
+    log header "Starting Full Installation"
+
+    verify_all || {
+        if [[ "$SKIP_CONFIRM" != "true" ]]; then
+            read -p "Continue anyway? (y/N) " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+        fi
+    }
+
+    clone_repo
+    create_directories
+    create_engine_env
+    install_all_deps
+    run_migrations
+    build_all
+
+    log header "Installation Complete"
+
+    if [[ ${#ERRORS[@]} -gt 0 ]]; then
+        log warn "Completed with warnings:"
+        for err in "${ERRORS[@]}"; do
+            echo -e "  ${YELLOW}!${NC} $err"
+        done
+    else
+        log success "All steps completed successfully"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Next steps:${NC}"
+    echo "  1. Start the server: ./run"
+    echo "  2. Create a bot: ./run create-bot --bot-name mybot"
+    echo ""
+}
+
+do_deps() {
+    log header "Installing Dependencies Only"
+    verify_bun || exit 1
+    install_all_deps
+    log success "Dependencies installed"
+}
+
+do_build() {
+    log header "Building Only"
+    verify_bun || exit 1
+    verify_java || exit 1
+    build_all
+    log success "Build complete"
+}
+
+do_migrate() {
+    log header "Running Migrations Only"
+    verify_bun || exit 1
+    setup_prisma_env
+    RUN_MIGRATIONS=true
+    run_migrations
+    log success "Migrations complete"
+}
+
+do_verify() {
+    verify_all
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    load_config
+    parse_args "$@"
+    setup_colors
+
+    if [[ "$DUMP_CONFIG" == "true" ]]; then
+        dump_config
+        exit 0
+    fi
+
+    case "$COMMAND" in
+        full)
+            do_full_install
+            ;;
+        deps)
+            do_deps
+            ;;
+        build)
+            do_build
+            ;;
+        migrate)
+            do_migrate
+            ;;
+        verify)
+            do_verify
+            ;;
+        clean)
+            clean_build
+            ;;
+        status)
+            show_status
+            ;;
+        *)
+            log error "Unknown command: $COMMAND"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

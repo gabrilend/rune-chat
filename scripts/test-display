@@ -1,0 +1,56 @@
+#!/bin/bash
+# Test script to debug display issues
+
+echo "=== Display Test ==="
+echo ""
+
+# Test 1: Basic box drawing
+echo "Test 1 - Box characters:"
+echo "┌────────────────────┐"
+echo "│ Hello World        │"
+echo "└────────────────────┘"
+echo ""
+
+# Test 2: Printf with variables
+echo "Test 2 - Printf with variables:"
+name="chatty"
+status="[OFFLINE]"
+user="chattybot"
+printf "│ > %-12s %s %-15s │\n" "$name" "$status" "$user"
+echo ""
+
+# Test 3: Printf -v then print
+echo "Test 3 - Printf -v:"
+printf -v myline "│ > %-12s %s %-15s │" "$name" "$status" "$user"
+echo "$myline"
+echo ""
+
+# Test 4: Building string manually
+echo "Test 4 - Manual string build:"
+line="│ > ${name}        ${status} ${user}     │"
+echo "$line"
+echo ""
+
+# Test 5: Check for weird characters in bot.env
+echo "Test 5 - Raw bot.env content:"
+if [[ -f "rs-sdk/bots/chatty/bot.env" ]]; then
+    echo "First line of chatty/bot.env:"
+    head -1 rs-sdk/bots/chatty/bot.env | cat -A
+else
+    echo "File not found"
+fi
+echo ""
+
+# Test 6: Loop test
+echo "Test 6 - Loop over bots:"
+i=0
+for dir in rs-sdk/bots/*/; do
+    [[ "$dir" == *"_template"* ]] && continue
+    bname=$(basename "$dir")
+    buser=$(grep "^BOT_USERNAME=" "${dir}bot.env" 2>/dev/null | cut -d= -f2 | tr -d '"'"'" || echo "none")
+    printf "│ %d %-12s %-15s │\n" "$i" "$bname" "$buser"
+    ((i++))
+done
+echo ""
+
+echo "=== End Test ==="

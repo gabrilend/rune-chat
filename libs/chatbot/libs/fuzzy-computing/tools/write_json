@@ -1,0 +1,251 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Tool metadata
+local tool_info = {
+    name = "write_json",
+    description = "Write structured data to a JSON file. " ..
+                  "Accepts Lua tables, C struct representations, or raw JSON data. " ..
+                  "If the file already exists, new data is merged with existing data " ..
+                  "(new keys are added, existing keys are updated). " ..
+                  "Use this for config files, data storage, or any structured data.",
+    parameters = {
+        type = "object",
+        properties = {
+            filename = {
+                type = "string",
+                description = "The JSON file to write (e.g., 'config.json', 'data/settings.json')"
+            },
+            data = {
+                type = "object",
+                description = "The data to write. Can be a Lua table, C struct representation, or any JSON-serializable structure."
+            }
+        },
+        required = {"filename", "data"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local filename = params.filename
+local data = params.data
+local project_dir = params._project_dir or "."
+
+if not filename then
+    print(json.encode({success = false, error = "Missing required parameter: filename"}))
+    os.exit(1)
+end
+
+if data == nil then
+    print(json.encode({success = false, error = "Missing required parameter: data"}))
+    os.exit(1)
+end
+
+-- Security: sanitize filename to prevent path traversal and shell injection
+local function sanitize_path(path)
+    local violations = {}
+    local original = path
+
+    -- Remove null bytes
+    if path:match("%z") then
+        table.insert(violations, "null bytes")
+        path = path:gsub("%z", "")
+    end
+
+    -- Remove or neutralize dangerous patterns
+    if path:match("%.%.") then
+        table.insert(violations, "'../' parent directory traversal")
+        path = path:gsub("%.%.", "")
+    end
+    if path:match("^~/") or path:match("^~$") then
+        table.insert(violations, "'~/' home directory expansion")
+        path = path:gsub("^~/", "")
+        path = path:gsub("^~", "")
+    end
+    if path:match("^/") then
+        table.insert(violations, "absolute path starting with '/'")
+        path = path:gsub("^/", "")
+    end
+    if path:match("%$[%w_]") or path:match("%$%b{}") then
+        table.insert(violations, "'$VAR' or '${VAR}' environment variable expansion")
+        path = path:gsub("%$[%w_]*", "")
+        path = path:gsub("%$%b{}", "")
+    end
+    if path:match("`.-`") or path:match("%$%(.-%)") then
+        table.insert(violations, "'`cmd`' or '$(cmd)' command substitution")
+        path = path:gsub("`.-`", "")
+        path = path:gsub("%$%(.-%)","")
+    end
+
+    -- Normalize (not a violation, just cleanup)
+    path = path:gsub("\\", "/")            -- normalize backslashes
+    path = path:gsub("/+", "/")            -- collapse multiple slashes
+    path = path:gsub("^/", "")             -- remove leading slash (again, after collapse)
+    path = path:gsub("/$", "")             -- remove trailing slash
+
+    return path, violations, original
+end
+
+local sanitized_filename, violations, original_filename = sanitize_path(filename)
+filename = sanitized_filename
+
+-- Report violations to help LLM learn
+if #violations > 0 then
+    print(json.encode({
+        success = false,
+        error = "Filename contained unsafe patterns that were rejected",
+        violations = violations,
+        original_filename = original_filename,
+        suggestion = "Use simple relative paths like 'config.json' or 'data/settings.json'. Do not use: parent traversal (..), home directory (~), absolute paths (/), environment variables ($VAR), or command substitution (`cmd` or $(cmd))."
+    }))
+    os.exit(1)
+end
+
+-- Reject if filename is empty after sanitization
+if filename == "" then
+    print(json.encode({success = false, error = "Invalid filename: empty after sanitization"}))
+    os.exit(1)
+end
+
+-- Ensure .json extension
+if not filename:match("%.json$") then
+    filename = filename .. ".json"
+end
+
+-- Build full path relative to project directory
+local full_path = project_dir .. "/" .. filename
+
+-- Ensure parent directory exists
+local parent_dir = full_path:match("(.*/)")
+if parent_dir then
+    os.execute('mkdir -p "' .. parent_dir .. '"')
+end
+
+-- Deep merge tables (new values override existing)
+local function deep_merge(existing, new)
+    if type(existing) ~= "table" or type(new) ~= "table" then
+        return new
+    end
+
+    local result = {}
+
+    -- Copy existing values
+    for k, v in pairs(existing) do
+        if type(v) == "table" then
+            result[k] = deep_merge({}, v)  -- deep copy
+        else
+            result[k] = v
+        end
+    end
+
+    -- Merge/override with new values
+    for k, v in pairs(new) do
+        if type(v) == "table" and type(result[k]) == "table" then
+            result[k] = deep_merge(result[k], v)
+        else
+            result[k] = v
+        end
+    end
+
+    return result
+end
+
+-- Read existing file if it exists
+local existing_data = nil
+local file_existed = false
+local file = io.open(full_path, "r")
+if file then
+    local content = file:read("*a")
+    file:close()
+    file_existed = true
+
+    if content and content ~= "" then
+        local parsed, _, parse_err = json.decode(content)
+        if parsed then
+            existing_data = parsed
+        else
+            print(json.encode({
+                success = false,
+                error = "Existing file contains invalid JSON",
+                filename = filename,
+                parse_error = tostring(parse_err),
+                suggestion = "Fix the existing JSON file or delete it to start fresh"
+            }))
+            os.exit(1)
+        end
+    end
+end
+
+-- Merge or use new data
+local final_data
+local was_merged = false
+if existing_data and type(existing_data) == "table" and type(data) == "table" then
+    final_data = deep_merge(existing_data, data)
+    was_merged = true
+else
+    final_data = data
+end
+
+-- Encode to JSON with pretty printing
+local json_output = json.encode(final_data, {indent = true})
+
+-- Write the file
+file, err = io.open(full_path, "w")
+if not file then
+    print(json.encode({success = false, error = "Failed to open file: " .. tostring(err)}))
+    os.exit(1)
+end
+
+file:write(json_output)
+file:write("\n")  -- trailing newline
+file:close()
+
+-- Get file info
+local line_count = select(2, json_output:gsub("\n", "\n")) + 1
+local byte_count = #json_output + 1  -- +1 for trailing newline
+
+-- Count keys at top level
+local function count_keys(t)
+    if type(t) ~= "table" then return 0 end
+    local count = 0
+    for _ in pairs(t) do count = count + 1 end
+    return count
+end
+
+local key_count = count_keys(final_data)
+
+-- Success message
+local message
+if was_merged then
+    message = string.format("Merged data into %s (%d top-level keys, %d bytes)",
+        full_path, key_count, byte_count)
+else
+    local action = file_existed and "Overwrote" or "Created"
+    message = string.format("%s %s (%d top-level keys, %d bytes)",
+        action, full_path, key_count, byte_count)
+end
+
+print(json.encode({
+    success = true,
+    message = message,
+    merged = was_merged,
+    keys = key_count
+}))

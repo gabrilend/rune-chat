@@ -1,0 +1,310 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Tool metadata
+local tool_info = {
+    name = "write_code",
+    description = "Write source code to a file in the src/ directory. " ..
+                  "Use this to create or modify code files. " ..
+                  "IMPORTANT: Content must be valid source code only. Any explanations or notes " ..
+                  "MUST be written as comments using the appropriate syntax for the file type " ..
+                  "(e.g., // or /* */ for C, # for Shell, -- for Lua). " ..
+                  "Lua and C files are validated for syntax errors before saving. " ..
+                  "This tool ONLY writes to src/ - use write_text for files outside src/.",
+    parameters = {
+        type = "object",
+        properties = {
+            filename = {
+                type = "string",
+                description = "The filename to write, including extension (e.g., 'hello.lua', 'utils.c'). Always saved to src/."
+            },
+            content = {
+                type = "string",
+                description = "The source code content to write. Must be valid code with comments for any explanatory text."
+            },
+            line_number = {
+                type = "number",
+                description = "Optional: insert content at this line number (1-indexed). Existing content shifts down. If omitted, overwrites entire file."
+            }
+        },
+        required = {"filename", "content"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local filename = params.filename
+local content = params.content
+local line_number = params.line_number
+local project_dir = params._project_dir or "."
+
+if not filename or not content then
+    print(json.encode({success = false, error = "Missing required parameters: filename and content"}))
+    os.exit(1)
+end
+
+-- Security: sanitize filename to prevent path traversal and shell injection
+local function sanitize_path(path)
+    local violations = {}
+    local original = path
+
+    -- Remove null bytes
+    if path:match("%z") then
+        table.insert(violations, "null bytes")
+        path = path:gsub("%z", "")
+    end
+
+    -- Remove or neutralize dangerous patterns
+    if path:match("%.%.") then
+        table.insert(violations, "'../' parent directory traversal")
+        path = path:gsub("%.%.", "")
+    end
+    if path:match("^~/") or path:match("^~$") then
+        table.insert(violations, "'~/' home directory expansion")
+        path = path:gsub("^~/", "")
+        path = path:gsub("^~", "")
+    end
+    if path:match("^/") then
+        table.insert(violations, "absolute path starting with '/'")
+        path = path:gsub("^/", "")
+    end
+    if path:match("%$[%w_]") or path:match("%$%b{}") then
+        table.insert(violations, "'$VAR' or '${VAR}' environment variable expansion")
+        path = path:gsub("%$[%w_]*", "")
+        path = path:gsub("%$%b{}", "")
+    end
+    if path:match("`.-`") or path:match("%$%(.-%)") then
+        table.insert(violations, "'`cmd`' or '$(cmd)' command substitution")
+        path = path:gsub("`.-`", "")
+        path = path:gsub("%$%(.-%)","")
+    end
+
+    -- Normalize (not a violation, just cleanup)
+    path = path:gsub("\\", "/")            -- normalize backslashes
+    path = path:gsub("/+", "/")            -- collapse multiple slashes
+    path = path:gsub("^/", "")             -- remove leading slash (again, after collapse)
+    path = path:gsub("/$", "")             -- remove trailing slash
+
+    return path, violations, original
+end
+
+local sanitized_filename, violations, original_filename = sanitize_path(filename)
+filename = sanitized_filename
+
+-- Report violations to help LLM learn
+if #violations > 0 then
+    print(json.encode({
+        success = false,
+        error = "Filename contained unsafe patterns that were rejected",
+        violations = violations,
+        original_filename = original_filename,
+        suggestion = "Use simple relative paths like 'myfile.lua' or 'subdir/myfile.lua'. Do not use: parent traversal (..), home directory (~), absolute paths (/), environment variables ($VAR), or command substitution (`cmd` or $(cmd))."
+    }))
+    os.exit(1)
+end
+
+-- Reject if filename is empty after sanitization
+if filename == "" then
+    print(json.encode({success = false, error = "Invalid filename: empty after sanitization"}))
+    os.exit(1)
+end
+
+-- Enforce src/ directory - strip any leading src/ from filename and always prepend it
+local clean_filename = filename:gsub("^src/", "")
+local target_dir = project_dir .. "/src"
+os.execute('mkdir -p "' .. target_dir .. '"')
+
+-- Handle subdirectories within src/
+local full_path
+if clean_filename:match("/") then
+    full_path = target_dir .. "/" .. clean_filename
+    local parent_dir = full_path:match("(.*/)")
+    if parent_dir then
+        os.execute('mkdir -p "' .. parent_dir .. '"')
+    end
+else
+    full_path = target_dir .. "/" .. clean_filename
+end
+
+-- Syntax validators by file extension (Lua, C, Bash only)
+-- JSON files should use write_json tool instead
+local validators = {
+    lua  = "luac -p '%s'",
+    c    = "gcc -fsyntax-only '%s'",
+    h    = "gcc -fsyntax-only -x c '%s'",
+    sh   = "bash -n '%s'",
+    bash = "bash -n '%s'",
+}
+
+-- Get file extension
+local function get_extension(path)
+    return path:match("%.([^%.]+)$")
+end
+
+-- Run syntax validation
+local function validate_syntax(path)
+    local ext = get_extension(path)
+    if not ext then return true, nil end
+
+    ext = ext:lower()
+    local validator_template = validators[ext]
+    if not validator_template then return true, nil end
+
+    local cmd = string.format(validator_template, path:gsub("'", "'\\''"))
+    local handle = io.popen(cmd .. " 2>&1")
+    if not handle then return true, nil end
+
+    local output = handle:read("*a")
+    local success = handle:close()
+
+    if success then
+        return true, nil
+    else
+        return false, output
+    end
+end
+
+-- Read existing file lines
+local function read_file_lines(path)
+    local lines = {}
+    local file = io.open(path, "r")
+    if file then
+        for line in file:lines() do
+            table.insert(lines, line)
+        end
+        file:close()
+    end
+    return lines
+end
+
+-- Insert content at line number
+local function insert_at_line(existing_lines, new_content, line_num)
+    -- Split new content into lines
+    local new_lines = {}
+    for line in (new_content .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(new_lines, line)
+    end
+    -- Remove trailing empty line if content didn't end with newline
+    if not new_content:match("\n$") and #new_lines > 0 and new_lines[#new_lines] == "" then
+        table.remove(new_lines)
+    end
+
+    -- Build result: lines before insert point, new lines, lines from insert point onward
+    local result = {}
+    for i = 1, line_num - 1 do
+        table.insert(result, existing_lines[i] or "")
+    end
+    for _, line in ipairs(new_lines) do
+        table.insert(result, line)
+    end
+    for i = line_num, #existing_lines do
+        table.insert(result, existing_lines[i])
+    end
+
+    return result
+end
+
+-- Check if file exists
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    return false
+end
+
+-- Handle line insertion vs full overwrite
+local final_content
+local total_existing_lines = 0
+
+if line_number then
+    -- Validate line number
+    if line_number < 1 then
+        print(json.encode({
+            success = false,
+            error = "Line number must be at least 1",
+            requested_line = line_number,
+            suggestion = "Use a line number >= 1, or omit line_number to overwrite the file"
+        }))
+        os.exit(1)
+    end
+
+    local existing_lines = read_file_lines(full_path)
+    total_existing_lines = #existing_lines
+
+    -- For insertion, allow line_number up to total_lines + 1 (append)
+    if line_number > total_existing_lines + 1 then
+        print(json.encode({
+            success = false,
+            error = string.format("Line number %d is out of range", line_number),
+            filename = full_path,
+            total_lines = total_existing_lines,
+            requested_line = line_number,
+            suggestion = string.format("Use a line number between 1 and %d, or omit line_number to overwrite the file", total_existing_lines + 1)
+        }))
+        os.exit(1)
+    end
+
+    local result_lines = insert_at_line(existing_lines, content, line_number)
+    final_content = table.concat(result_lines, "\n")
+else
+    final_content = content
+end
+
+-- Write the file
+local file, write_err = io.open(full_path, "w")
+if not file then
+    print(json.encode({success = false, error = "Failed to open file: " .. tostring(write_err)}))
+    os.exit(1)
+end
+
+file:write(final_content)
+file:close()
+
+-- Get file info
+local line_count = select(2, final_content:gsub("\n", "\n")) + 1
+local byte_count = #final_content
+
+-- Validate syntax if we have a validator for this file type
+local valid, syntax_errors = validate_syntax(full_path)
+if not valid then
+    print(json.encode({
+        success = false,
+        error = "Syntax error in code",
+        filename = full_path,
+        syntax_errors = syntax_errors,
+        lines_written = line_count,
+        suggestion = "Fix the syntax error and try again"
+    }))
+    os.exit(1)
+end
+
+-- Success message
+local message
+if line_number then
+    message = string.format("Inserted %d lines at line %d in %s (now %d lines, %d bytes)",
+        select(2, content:gsub("\n", "\n")) + 1, line_number, full_path, line_count, byte_count)
+else
+    message = string.format("Wrote %d lines (%d bytes) to %s", line_count, byte_count, full_path)
+end
+
+print(json.encode({
+    success = true,
+    message = message
+}))

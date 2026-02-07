@@ -1,0 +1,1208 @@
+#!/usr/bin/env bash
+#
+# rs-sdk dependency builder
+# Compiles dependencies from source for systems without prebuilt binaries
+#
+
+set -e
+
+# =============================================================================
+# DEFAULTS
+# =============================================================================
+
+LIBS_DIR="/home/ritz/programming/ai-stuff/runescape/libs"
+BUILD_DIR="/home/ritz/programming/ai-stuff/runescape/libs/.build"
+PROJECT_ROOT="/home/ritz/programming/ai-stuff/runescape/rs-sdk"
+
+BUILD_OPENSSL=true
+OPENSSL_VERSION="3.2.1"
+OPENSSL_URL=""
+
+BUILD_PRISMA_ENGINES=true
+PRISMA_ENGINES_VERSION="6.10.1"
+PRISMA_ENGINES_REPO="https://github.com/prisma/prisma-engines.git"
+BUILD_SCHEMA_ENGINE=true
+BUILD_QUERY_ENGINE=true
+BUILD_QUERY_ENGINE_LIBRARY=true
+
+BUILD_JOBS=0
+RELEASE_BUILD=true
+KEEP_BUILD_DIR=false
+FORCE_REBUILD=false
+
+# Chatbot library (local Lua library)
+SYNC_CHATBOT=true
+CHATBOT_SOURCE="/home/ritz/programming/lua/chatbot"
+
+LOG_LEVEL=info
+COLOR_OUTPUT=true
+VERBOSE=false
+QUIET=false
+
+# =============================================================================
+# COLOR DEFINITIONS
+# =============================================================================
+
+setup_colors() {
+    if [[ "$COLOR_OUTPUT" == "true" ]] && [[ -t 1 ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        BOLD='\033[1m'
+        DIM='\033[2m'
+        NC='\033[0m'
+    else
+        RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' NC=''
+    fi
+}
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+
+    [[ "$QUIET" == "true" ]] && [[ "$level" != "error" ]] && return
+
+    case "$level" in
+        debug)
+            [[ "$VERBOSE" != "true" ]] && return
+            echo -e "${DIM}[$timestamp]${NC} ${CYAN}[DEBUG]${NC} $message"
+            ;;
+        info)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}[INFO]${NC} $message"
+            ;;
+        warn)
+            echo -e "${DIM}[$timestamp]${NC} ${YELLOW}[WARN]${NC} $message"
+            ;;
+        error)
+            echo -e "${DIM}[$timestamp]${NC} ${RED}[ERROR]${NC} $message" >&2
+            ;;
+        success)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}${BOLD}[OK]${NC} $message"
+            ;;
+        header)
+            echo -e "\n${BOLD}${BLUE}=== $message ===${NC}\n"
+            ;;
+        step)
+            echo -e "${BOLD}${MAGENTA}>>>${NC} $message"
+            ;;
+        progress)
+            echo -e "    ${DIM}...${NC} $message"
+            ;;
+    esac
+}
+
+# =============================================================================
+# CONFIG FILE LOADING
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/../config/build-deps.conf"
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log debug "Loading config from $CONFIG_FILE"
+        while IFS='=' read -r key value; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+            if [[ -n "$key" ]] && [[ -n "$value" ]]; then
+                export "$key"="$value"
+            fi
+        done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep '=')
+    fi
+}
+
+# =============================================================================
+# HELP
+# =============================================================================
+
+show_help() {
+    cat << EOF
+${BOLD}rs-sdk dependency builder${NC}
+
+Compiles dependencies from source for systems without prebuilt binaries (e.g., NixOS)
+
+${BOLD}USAGE:${NC}
+    $(basename "$0") [OPTIONS] [COMMAND]
+
+${BOLD}COMMANDS:${NC}
+    all             Build all dependencies (default)
+    openssl         Build OpenSSL only
+    prisma          Build Prisma engines only
+    chatbot         Sync chatbot library only
+    env             Generate environment script only
+    status          Show build status
+    clean           Clean build directory
+    verify          Verify built dependencies
+
+${BOLD}OPENSSL OPTIONS:${NC}
+    --openssl                   Build OpenSSL
+    --no-openssl                Skip OpenSSL
+    --openssl-version VERSION   OpenSSL version (default: ${OPENSSL_VERSION})
+
+${BOLD}PRISMA OPTIONS:${NC}
+    --prisma                    Build Prisma engines
+    --no-prisma                 Skip Prisma engines
+    --prisma-version VERSION    Prisma engines version (default: ${PRISMA_ENGINES_VERSION})
+    --schema-engine             Build schema-engine binary
+    --no-schema-engine          Skip schema-engine
+    --query-engine              Build query-engine binary
+    --no-query-engine           Skip query-engine
+    --query-engine-lib          Build libquery_engine.node
+    --no-query-engine-lib       Skip libquery_engine.node
+
+${BOLD}CHATBOT OPTIONS:${NC}
+    --chatbot                   Sync chatbot library
+    --no-chatbot                Skip chatbot library
+    --chatbot-source DIR        Chatbot source directory
+
+${BOLD}BUILD OPTIONS:${NC}
+    -j, --jobs NUM              Parallel build jobs (0 = auto)
+    --release                   Release build (default)
+    --debug                     Debug build
+    -f, --force                 Force rebuild even if exists
+    --keep-build-dir            Keep build directory after
+    --clean-build-dir           Clean build directory after (default)
+
+${BOLD}PATH OPTIONS:${NC}
+    --libs-dir DIR              Installation directory
+    --build-dir DIR             Build/temp directory
+    --config FILE               Config file path
+
+${BOLD}OUTPUT OPTIONS:${NC}
+    -v, --verbose               Verbose output
+    -q, --quiet                 Quiet mode
+    --no-color                  Disable colors
+
+${BOLD}OTHER OPTIONS:${NC}
+    -h, --help                  Show this help
+    --version                   Show version
+    --dry-run                   Show what would be done
+
+${BOLD}EXAMPLES:${NC}
+    $(basename "$0")                        # Build all dependencies
+    $(basename "$0") prisma                 # Build Prisma engines only
+    $(basename "$0") --prisma-version 6.10.1
+    $(basename "$0") status                 # Check what's built
+    $(basename "$0") clean                  # Clean build artifacts
+    $(basename "$0") -f                     # Force rebuild
+
+${BOLD}AFTER BUILDING:${NC}
+    Export these environment variables before running Prisma commands:
+
+    export PRISMA_SCHEMA_ENGINE_BINARY="${LIBS_DIR}/prisma-engines/schema-engine"
+    export PRISMA_QUERY_ENGINE_BINARY="${LIBS_DIR}/prisma-engines/query-engine"
+    export PRISMA_QUERY_ENGINE_LIBRARY="${LIBS_DIR}/prisma-engines/libquery_engine.node"
+    export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
+
+EOF
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+COMMAND="all"
+DRY_RUN=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            all|openssl|prisma|chatbot|env|status|clean|verify)
+                COMMAND="$1"; shift ;;
+
+            --openssl) BUILD_OPENSSL=true; shift ;;
+            --no-openssl) BUILD_OPENSSL=false; shift ;;
+            --openssl-version) OPENSSL_VERSION="$2"; shift 2 ;;
+
+            --prisma) BUILD_PRISMA_ENGINES=true; shift ;;
+            --no-prisma) BUILD_PRISMA_ENGINES=false; shift ;;
+            --prisma-version) PRISMA_ENGINES_VERSION="$2"; shift 2 ;;
+            --schema-engine) BUILD_SCHEMA_ENGINE=true; shift ;;
+            --no-schema-engine) BUILD_SCHEMA_ENGINE=false; shift ;;
+            --query-engine) BUILD_QUERY_ENGINE=true; shift ;;
+            --no-query-engine) BUILD_QUERY_ENGINE=false; shift ;;
+            --query-engine-lib) BUILD_QUERY_ENGINE_LIBRARY=true; shift ;;
+            --no-query-engine-lib) BUILD_QUERY_ENGINE_LIBRARY=false; shift ;;
+
+            --chatbot) SYNC_CHATBOT=true; shift ;;
+            --no-chatbot) SYNC_CHATBOT=false; shift ;;
+            --chatbot-source) CHATBOT_SOURCE="$2"; shift 2 ;;
+
+            -j|--jobs) BUILD_JOBS="$2"; shift 2 ;;
+            --release) RELEASE_BUILD=true; shift ;;
+            --debug) RELEASE_BUILD=false; shift ;;
+            -f|--force) FORCE_REBUILD=true; shift ;;
+            --keep-build-dir) KEEP_BUILD_DIR=true; shift ;;
+            --clean-build-dir) KEEP_BUILD_DIR=false; shift ;;
+
+            --libs-dir) LIBS_DIR="$2"; shift 2 ;;
+            --build-dir) BUILD_DIR="$2"; shift 2 ;;
+            --config) CONFIG_FILE="$2"; load_config; shift 2 ;;
+
+            -v|--verbose) VERBOSE=true; shift ;;
+            -q|--quiet) QUIET=true; shift ;;
+            --no-color) COLOR_OUTPUT=false; shift ;;
+
+            -h|--help) show_help; exit 0 ;;
+            --version) echo "build-deps v1.0.0"; exit 0 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+
+            *)
+                log error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# VERIFICATION
+# =============================================================================
+
+verify_rust() {
+    log step "Checking Rust installation..."
+
+    if ! command -v cargo &> /dev/null; then
+        log error "Cargo not found. Please install Rust: https://rustup.rs"
+        return 1
+    fi
+
+    if ! command -v rustc &> /dev/null; then
+        log error "Rustc not found. Please install Rust: https://rustup.rs"
+        return 1
+    fi
+
+    local cargo_version
+    cargo_version=$(cargo --version | cut -d' ' -f2)
+    log success "Cargo ${cargo_version} found"
+
+    return 0
+}
+
+verify_git() {
+    if ! command -v git &> /dev/null; then
+        log error "Git not found"
+        return 1
+    fi
+    return 0
+}
+
+verify_openssl() {
+    log step "Checking OpenSSL..."
+
+    if command -v openssl &> /dev/null; then
+        local version
+        version=$(openssl version | cut -d' ' -f2)
+        log success "OpenSSL ${version} found"
+        return 0
+    fi
+
+    # Check for pkg-config openssl
+    if command -v pkg-config &> /dev/null; then
+        if pkg-config --exists openssl 2>/dev/null; then
+            log success "OpenSSL found via pkg-config"
+            return 0
+        fi
+    fi
+
+    log warn "OpenSSL not found - build may fail"
+    return 1
+}
+
+verify_prerequisites() {
+    log header "Verifying Prerequisites"
+
+    local ok=true
+
+    verify_git || ok=false
+    verify_rust || ok=false
+    verify_openssl || true  # Non-fatal warning
+
+    if [[ "$ok" != "true" ]]; then
+        log error "Missing prerequisites"
+        return 1
+    fi
+
+    log success "All prerequisites satisfied"
+    return 0
+}
+
+# =============================================================================
+# OPENSSL BUILD
+# =============================================================================
+
+# These will be set by init_paths() after config is loaded
+openssl_dir=""
+prisma_engines_dir=""
+
+init_paths() {
+    openssl_dir="${LIBS_DIR}/openssl"
+    prisma_engines_dir="${LIBS_DIR}/prisma-engines"
+}
+
+# Detect OpenSSL lib directory (lib vs lib64)
+get_openssl_lib_dir() {
+    if [[ -f "${openssl_dir}/lib64/libssl.so" ]] || [[ -f "${openssl_dir}/lib64/libssl.a" ]]; then
+        echo "${openssl_dir}/lib64"
+    else
+        echo "${openssl_dir}/lib"
+    fi
+}
+
+check_openssl_lib_exists() {
+    [[ -f "${openssl_dir}/lib/libssl.so" ]] || [[ -f "${openssl_dir}/lib/libssl.a" ]] || \
+    [[ -f "${openssl_dir}/lib64/libssl.so" ]] || [[ -f "${openssl_dir}/lib64/libssl.a" ]]
+}
+
+check_openssl_built() {
+    check_openssl_lib_exists
+}
+
+download_openssl() {
+    local src_dir="${BUILD_DIR}/openssl-${OPENSSL_VERSION}"
+    local tarball="${BUILD_DIR}/openssl-${OPENSSL_VERSION}.tar.gz"
+
+    if [[ -d "$src_dir" ]]; then
+        log info "OpenSSL source already downloaded"
+        return 0
+    fi
+
+    log step "Downloading OpenSSL ${OPENSSL_VERSION}..."
+    mkdir -p "$BUILD_DIR"
+
+    local url="${OPENSSL_URL}"
+    if [[ -z "$url" ]]; then
+        url="https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+    fi
+
+    if command -v curl &> /dev/null; then
+        curl -L -o "$tarball" "$url" 2>&1 | while read -r line; do
+            log progress "$line"
+        done
+    elif command -v wget &> /dev/null; then
+        wget -O "$tarball" "$url" 2>&1 | while read -r line; do
+            log progress "$line"
+        done
+    else
+        log error "Neither curl nor wget found"
+        return 1
+    fi
+
+    log step "Extracting OpenSSL..."
+    cd "$BUILD_DIR"
+    tar -xzf "$tarball"
+
+    log success "OpenSSL source ready"
+}
+
+build_openssl() {
+    if [[ "$BUILD_OPENSSL" != "true" ]]; then
+        log debug "Skipping OpenSSL build"
+        return 0
+    fi
+
+    log header "Building OpenSSL"
+
+    # Check if already built
+    if [[ "$FORCE_REBUILD" != "true" ]] && check_openssl_built; then
+        log success "OpenSSL already built"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would build OpenSSL ${OPENSSL_VERSION}"
+        return 0
+    fi
+
+    # Check for required tools
+    if ! command -v make &> /dev/null; then
+        log error "make not found - required for OpenSSL build"
+        return 1
+    fi
+
+    if ! command -v perl &> /dev/null; then
+        log error "perl not found - required for OpenSSL build"
+        return 1
+    fi
+
+    # Download source
+    download_openssl || return 1
+
+    local src_dir="${BUILD_DIR}/openssl-${OPENSSL_VERSION}"
+    cd "$src_dir"
+
+    # Determine parallel jobs
+    local jobs="${BUILD_JOBS}"
+    if [[ "$jobs" -eq 0 ]]; then
+        jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    fi
+
+    # Create output directory
+    mkdir -p "$openssl_dir"
+
+    # Configure
+    log step "Configuring OpenSSL..."
+    ./config \
+        --prefix="$openssl_dir" \
+        --openssldir="$openssl_dir" \
+        shared \
+        2>&1 | while read -r line; do log progress "$line"; done
+
+    # Build
+    log step "Building OpenSSL (this may take a while)..."
+    make -j"$jobs" 2>&1 | while read -r line; do log progress "$line"; done
+
+    # Install to local directory
+    log step "Installing OpenSSL to ${openssl_dir}..."
+    make install_sw 2>&1 | while read -r line; do log progress "$line"; done
+
+    # Write version file
+    echo "$OPENSSL_VERSION" > "${openssl_dir}/VERSION"
+
+    log success "OpenSSL ${OPENSSL_VERSION} built successfully"
+}
+
+# =============================================================================
+# PRISMA ENGINES BUILD
+# =============================================================================
+
+check_prisma_engines_built() {
+    local all_built=true
+
+    if [[ "$BUILD_SCHEMA_ENGINE" == "true" ]]; then
+        [[ ! -x "${prisma_engines_dir}/schema-engine" ]] && all_built=false
+    fi
+
+    if [[ "$BUILD_QUERY_ENGINE" == "true" ]]; then
+        [[ ! -x "${prisma_engines_dir}/query-engine" ]] && all_built=false
+    fi
+
+    if [[ "$BUILD_QUERY_ENGINE_LIBRARY" == "true" ]]; then
+        [[ ! -f "${prisma_engines_dir}/libquery_engine.node" ]] && all_built=false
+    fi
+
+    [[ "$all_built" == "true" ]]
+}
+
+clone_prisma_engines() {
+    local src_dir="${BUILD_DIR}/prisma-engines"
+
+    if [[ -d "$src_dir/.git" ]]; then
+        cd "$src_dir"
+
+        # Check if we already have the desired version
+        local current_tag
+        current_tag=$(git describe --tags --exact-match 2>/dev/null || echo "")
+
+        if [[ "$current_tag" == "$PRISMA_ENGINES_VERSION" ]]; then
+            log info "Prisma engines source already at version ${PRISMA_ENGINES_VERSION}"
+            return 0
+        fi
+
+        # Only fetch if needed - check if the tag exists locally first
+        if git rev-parse "refs/tags/${PRISMA_ENGINES_VERSION}" &>/dev/null; then
+            log info "Prisma engines source already cloned, version tag exists locally"
+        else
+            log info "Prisma engines source exists but version ${PRISMA_ENGINES_VERSION} not found locally"
+            log step "Fetching tag ${PRISMA_ENGINES_VERSION}..."
+            # Fetch only the specific tag we need, not all tags
+            git fetch --depth 1 origin "refs/tags/${PRISMA_ENGINES_VERSION}:refs/tags/${PRISMA_ENGINES_VERSION}" 2>&1 | while read -r line; do
+                log progress "$line"
+            done
+        fi
+    else
+        log step "Cloning Prisma engines repository..."
+        mkdir -p "$BUILD_DIR"
+        git clone --depth 1 --branch "${PRISMA_ENGINES_VERSION}" \
+            "$PRISMA_ENGINES_REPO" "$src_dir" 2>&1 | while read -r line; do
+            log progress "$line"
+        done
+    fi
+
+    cd "$src_dir"
+    git checkout "${PRISMA_ENGINES_VERSION}" 2>/dev/null || {
+        log warn "Tag ${PRISMA_ENGINES_VERSION} not found, trying as branch..."
+        git checkout "origin/${PRISMA_ENGINES_VERSION}" 2>/dev/null || {
+            log error "Version ${PRISMA_ENGINES_VERSION} not found"
+            return 1
+        }
+    }
+
+    log success "Checked out version ${PRISMA_ENGINES_VERSION}"
+}
+
+build_prisma_engines() {
+    if [[ "$BUILD_PRISMA_ENGINES" != "true" ]]; then
+        log debug "Skipping Prisma engines build"
+        return 0
+    fi
+
+    log header "Building Prisma Engines"
+
+    # Check if already built
+    if [[ "$FORCE_REBUILD" != "true" ]] && check_prisma_engines_built; then
+        log success "Prisma engines already built"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would build Prisma engines ${PRISMA_ENGINES_VERSION}"
+        return 0
+    fi
+
+    # Clone source
+    clone_prisma_engines || return 1
+
+    local src_dir="${BUILD_DIR}/prisma-engines"
+    cd "$src_dir"
+
+    # Set up OpenSSL environment if locally built
+    if [[ -d "$openssl_dir" ]] && check_openssl_lib_exists; then
+        local ssl_lib_dir
+        ssl_lib_dir=$(get_openssl_lib_dir)
+        log info "Using locally built OpenSSL from ${openssl_dir}"
+        log info "OpenSSL lib directory: ${ssl_lib_dir}"
+        export OPENSSL_DIR="$openssl_dir"
+        export OPENSSL_LIB_DIR="$ssl_lib_dir"
+        export OPENSSL_INCLUDE_DIR="${openssl_dir}/include"
+        export PKG_CONFIG_PATH="${ssl_lib_dir}/pkgconfig:${PKG_CONFIG_PATH:-}"
+        export LD_LIBRARY_PATH="${ssl_lib_dir}:${LD_LIBRARY_PATH:-}"
+        export LIBRARY_PATH="${ssl_lib_dir}:${LIBRARY_PATH:-}"
+        export C_INCLUDE_PATH="${openssl_dir}/include:${C_INCLUDE_PATH:-}"
+    else
+        log warn "Local OpenSSL not found - using system OpenSSL (build may fail on NixOS)"
+        log info "Run './build-deps openssl' first to build OpenSSL locally"
+    fi
+
+    # Determine build profile
+    local profile="release"
+    local profile_dir="release"
+    if [[ "$RELEASE_BUILD" != "true" ]]; then
+        profile="dev"
+        profile_dir="debug"
+    fi
+
+    # Determine parallel jobs
+    local jobs_flag=""
+    if [[ "$BUILD_JOBS" -gt 0 ]]; then
+        jobs_flag="-j${BUILD_JOBS}"
+    fi
+
+    # Create output directory
+    mkdir -p "$prisma_engines_dir"
+
+    # Build schema-engine
+    if [[ "$BUILD_SCHEMA_ENGINE" == "true" ]]; then
+        log step "Building schema-engine..."
+        cargo build --package schema-engine-cli --profile "$profile" $jobs_flag 2>&1 | \
+            while read -r line; do log progress "$line"; done
+
+        cp "target/${profile_dir}/schema-engine" "${prisma_engines_dir}/"
+        chmod +x "${prisma_engines_dir}/schema-engine"
+        log success "schema-engine built"
+    fi
+
+    # Build query-engine binary
+    if [[ "$BUILD_QUERY_ENGINE" == "true" ]]; then
+        log step "Building query-engine..."
+        cargo build --package query-engine --profile "$profile" $jobs_flag 2>&1 | \
+            while read -r line; do log progress "$line"; done
+
+        cp "target/${profile_dir}/query-engine" "${prisma_engines_dir}/"
+        chmod +x "${prisma_engines_dir}/query-engine"
+        log success "query-engine built"
+    fi
+
+    # Build query-engine library (libquery_engine.node)
+    if [[ "$BUILD_QUERY_ENGINE_LIBRARY" == "true" ]]; then
+        log step "Building libquery_engine.node..."
+        cargo build --package query-engine-node-api --profile "$profile" $jobs_flag 2>&1 | \
+            while read -r line; do log progress "$line"; done
+
+        # The library might be named differently on different platforms
+        local lib_name="libquery_engine.so"
+        if [[ -f "target/${profile_dir}/libquery_engine.so" ]]; then
+            cp "target/${profile_dir}/libquery_engine.so" "${prisma_engines_dir}/libquery_engine.node"
+        elif [[ -f "target/${profile_dir}/libquery_engine.dylib" ]]; then
+            cp "target/${profile_dir}/libquery_engine.dylib" "${prisma_engines_dir}/libquery_engine.node"
+        elif [[ -f "target/${profile_dir}/query_engine.dll" ]]; then
+            cp "target/${profile_dir}/query_engine.dll" "${prisma_engines_dir}/libquery_engine.node"
+        else
+            log error "Could not find built query engine library"
+            ls -la "target/${profile_dir}/" | grep -i query
+            return 1
+        fi
+
+        log success "libquery_engine.node built"
+    fi
+
+    # Write version file
+    echo "$PRISMA_ENGINES_VERSION" > "${prisma_engines_dir}/VERSION"
+
+    log success "Prisma engines ${PRISMA_ENGINES_VERSION} built successfully"
+
+    # Generate env script
+    generate_env_script
+
+    log info "Environment script created: ${LIBS_DIR}/env.sh"
+    log info "Usage: source ${LIBS_DIR}/env.sh"
+}
+
+# =============================================================================
+# CHATBOT LIBRARY SYNC
+# =============================================================================
+
+chatbot_dir="${LIBS_DIR}/chatbot"
+
+check_chatbot_synced() {
+    [[ -f "${chatbot_dir}/chatbot.lua" ]] && \
+    [[ -d "${chatbot_dir}/libs/fuzzy-computing" ]]
+}
+
+sync_chatbot() {
+    if [[ "$SYNC_CHATBOT" != "true" ]]; then
+        log debug "Skipping chatbot sync"
+        return 0
+    fi
+
+    log header "Syncing Chatbot Library"
+
+    # Check source exists
+    if [[ ! -d "$CHATBOT_SOURCE" ]]; then
+        log error "Chatbot source not found: $CHATBOT_SOURCE"
+        return 1
+    fi
+
+    if [[ ! -f "${CHATBOT_SOURCE}/chatbot.lua" ]]; then
+        log error "chatbot.lua not found in source directory"
+        return 1
+    fi
+
+    # Check if already synced (skip if no changes, unless forced)
+    if [[ "$FORCE_REBUILD" != "true" ]] && check_chatbot_synced; then
+        # Quick check if source is newer than dest
+        local src_time dest_time
+        src_time=$(stat -c %Y "${CHATBOT_SOURCE}/chatbot.lua" 2>/dev/null || echo 0)
+        dest_time=$(stat -c %Y "${chatbot_dir}/chatbot.lua" 2>/dev/null || echo 0)
+
+        if [[ "$src_time" -le "$dest_time" ]]; then
+            log success "Chatbot library already synced"
+            return 0
+        fi
+        log info "Chatbot source has changes, resyncing..."
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would sync chatbot from $CHATBOT_SOURCE"
+        return 0
+    fi
+
+    log step "Syncing chatbot from ${CHATBOT_SOURCE}..."
+    mkdir -p "$chatbot_dir"
+
+    # rsync with archive mode, excluding git and temporary files
+    rsync -av --delete \
+        --exclude='.git' \
+        --exclude='.claude' \
+        --exclude='records' \
+        --exclude='images' \
+        --exclude='*.log' \
+        --exclude='.chat_initialized' \
+        "${CHATBOT_SOURCE}/" "${chatbot_dir}/"
+
+    if [[ $? -eq 0 ]]; then
+        log success "Chatbot library synced successfully"
+
+        # Create version marker
+        echo "synced=$(date -Iseconds)" > "${chatbot_dir}/VERSION"
+        echo "source=${CHATBOT_SOURCE}" >> "${chatbot_dir}/VERSION"
+    else
+        log error "Failed to sync chatbot library"
+        return 1
+    fi
+}
+
+# =============================================================================
+# ENVIRONMENT SCRIPT GENERATION
+# =============================================================================
+
+generate_env_script() {
+    log step "Generating environment script..."
+
+    # Find gcc lib path for NixOS
+    local gcc_lib_path=""
+    if [[ -d "/nix/store" ]]; then
+        gcc_lib_path=$(find /nix/store -maxdepth 1 -name "*gcc*-lib" -type d 2>/dev/null | head -1)
+        if [[ -n "$gcc_lib_path" ]] && [[ -f "${gcc_lib_path}/lib/libstdc++.so.6" ]]; then
+            gcc_lib_path="${gcc_lib_path}/lib"
+        else
+            gcc_lib_path=""
+        fi
+    fi
+
+    cat > "${LIBS_DIR}/env.sh" << ENVEOF
+#!/usr/bin/env bash
+# rs-sdk local dependencies environment
+# Source this file to configure the environment for rs-sdk
+# Usage: source ${LIBS_DIR}/env.sh
+
+# =============================================================================
+# Prisma Engines (locally built)
+# =============================================================================
+ENVEOF
+
+    if [[ -d "$prisma_engines_dir" ]] && [[ -x "${prisma_engines_dir}/schema-engine" ]]; then
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+export PRISMA_SCHEMA_ENGINE_BINARY="${prisma_engines_dir}/schema-engine"
+export PRISMA_QUERY_ENGINE_BINARY="${prisma_engines_dir}/query-engine"
+export PRISMA_QUERY_ENGINE_LIBRARY="${prisma_engines_dir}/libquery_engine.node"
+export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
+ENVEOF
+    else
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+# Prisma engines not built yet - run: ./build-deps prisma
+ENVEOF
+    fi
+
+    # OpenSSL (locally built)
+    cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+
+# =============================================================================
+# OpenSSL (locally built)
+# =============================================================================
+ENVEOF
+
+    if [[ -d "$openssl_dir" ]] && check_openssl_lib_exists; then
+        local ssl_lib_dir
+        ssl_lib_dir=$(get_openssl_lib_dir)
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+export OPENSSL_DIR="${openssl_dir}"
+export OPENSSL_LIB_DIR="${ssl_lib_dir}"
+export OPENSSL_INCLUDE_DIR="${openssl_dir}/include"
+if [[ -z "\$__RS_SDK_OPENSSL_PATH_SET" ]]; then
+    export PKG_CONFIG_PATH="${ssl_lib_dir}/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
+    export LD_LIBRARY_PATH="${ssl_lib_dir}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+    export LIBRARY_PATH="${ssl_lib_dir}\${LIBRARY_PATH:+:\$LIBRARY_PATH}"
+    export C_INCLUDE_PATH="${openssl_dir}/include\${C_INCLUDE_PATH:+:\$C_INCLUDE_PATH}"
+    export __RS_SDK_OPENSSL_PATH_SET=1
+fi
+ENVEOF
+    else
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+# OpenSSL not built yet - run: ./build-deps openssl
+ENVEOF
+    fi
+
+    # NixOS-specific library paths
+    if [[ -n "$gcc_lib_path" ]]; then
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+
+# =============================================================================
+# NixOS Library Paths (for native Node.js modules like bcrypt)
+# =============================================================================
+if [[ -z "\$__RS_SDK_LD_LIBRARY_PATH_SET" ]]; then
+    export LD_LIBRARY_PATH="${gcc_lib_path}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+    export __RS_SDK_LD_LIBRARY_PATH_SET=1
+fi
+ENVEOF
+    fi
+
+    # Puppeteer Chromium path (if system chromium exists)
+    local chromium_path=""
+    if command -v chromium &>/dev/null; then
+        chromium_path=$(which chromium)
+    elif command -v chromium-browser &>/dev/null; then
+        chromium_path=$(which chromium-browser)
+    elif command -v google-chrome-stable &>/dev/null; then
+        chromium_path=$(which google-chrome-stable)
+    fi
+
+    if [[ -n "$chromium_path" ]]; then
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+
+# =============================================================================
+# Puppeteer (use system Chromium instead of downloading)
+# =============================================================================
+export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+export PUPPETEER_EXECUTABLE_PATH="${chromium_path}"
+ENVEOF
+    fi
+
+    cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+
+# =============================================================================
+# Status
+# =============================================================================
+echo "rs-sdk environment configured"
+echo "  Prisma engines: ${prisma_engines_dir}"
+ENVEOF
+
+    if [[ -n "$gcc_lib_path" ]]; then
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+echo "  LD_LIBRARY_PATH: configured for NixOS"
+ENVEOF
+    fi
+
+    if [[ -n "$chromium_path" ]]; then
+        cat >> "${LIBS_DIR}/env.sh" << ENVEOF
+echo "  Puppeteer: using system Chromium"
+ENVEOF
+    fi
+
+    chmod +x "${LIBS_DIR}/env.sh"
+    log success "Environment script generated"
+}
+
+# =============================================================================
+# STATUS
+# =============================================================================
+
+show_status() {
+    log header "Dependency Build Status"
+
+    echo -e "${BOLD}Prisma Engines:${NC} (target: ${PRISMA_ENGINES_VERSION})"
+
+    if [[ -f "${prisma_engines_dir}/VERSION" ]]; then
+        local built_version
+        built_version=$(cat "${prisma_engines_dir}/VERSION")
+        echo -e "  ${DIM}Installed version:${NC} ${built_version}"
+    fi
+
+    if [[ -x "${prisma_engines_dir}/schema-engine" ]]; then
+        local size
+        size=$(du -h "${prisma_engines_dir}/schema-engine" | cut -f1)
+        echo -e "  ${GREEN}●${NC} schema-engine (${size})"
+    else
+        echo -e "  ${RED}●${NC} schema-engine ${DIM}(not built)${NC}"
+    fi
+
+    if [[ -x "${prisma_engines_dir}/query-engine" ]]; then
+        local size
+        size=$(du -h "${prisma_engines_dir}/query-engine" | cut -f1)
+        echo -e "  ${GREEN}●${NC} query-engine (${size})"
+    else
+        echo -e "  ${RED}●${NC} query-engine ${DIM}(not built)${NC}"
+    fi
+
+    if [[ -f "${prisma_engines_dir}/libquery_engine.node" ]]; then
+        local size
+        size=$(du -h "${prisma_engines_dir}/libquery_engine.node" | cut -f1)
+        echo -e "  ${GREEN}●${NC} libquery_engine.node (${size})"
+    else
+        echo -e "  ${RED}●${NC} libquery_engine.node ${DIM}(not built)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}OpenSSL:${NC} (target: ${OPENSSL_VERSION})"
+
+    if [[ -f "${openssl_dir}/VERSION" ]]; then
+        local built_version
+        built_version=$(cat "${openssl_dir}/VERSION")
+        echo -e "  ${DIM}Installed version:${NC} ${built_version}"
+    fi
+
+    local ssl_lib_dir
+    ssl_lib_dir=$(get_openssl_lib_dir)
+
+    if [[ -f "${ssl_lib_dir}/libssl.so" ]]; then
+        local size
+        size=$(du -h "${ssl_lib_dir}/libssl.so" | cut -f1)
+        echo -e "  ${GREEN}●${NC} libssl.so (${size}) - ${ssl_lib_dir}"
+    elif [[ -f "${ssl_lib_dir}/libssl.a" ]]; then
+        local size
+        size=$(du -h "${ssl_lib_dir}/libssl.a" | cut -f1)
+        echo -e "  ${GREEN}●${NC} libssl.a (${size}) - ${ssl_lib_dir}"
+    else
+        echo -e "  ${RED}●${NC} libssl ${DIM}(not built)${NC}"
+    fi
+
+    if [[ -f "${ssl_lib_dir}/libcrypto.so" ]]; then
+        local size
+        size=$(du -h "${ssl_lib_dir}/libcrypto.so" | cut -f1)
+        echo -e "  ${GREEN}●${NC} libcrypto.so (${size})"
+    elif [[ -f "${ssl_lib_dir}/libcrypto.a" ]]; then
+        local size
+        size=$(du -h "${ssl_lib_dir}/libcrypto.a" | cut -f1)
+        echo -e "  ${GREEN}●${NC} libcrypto.a (${size})"
+    else
+        echo -e "  ${RED}●${NC} libcrypto ${DIM}(not built)${NC}"
+    fi
+
+    if [[ -x "${openssl_dir}/bin/openssl" ]]; then
+        echo -e "  ${GREEN}●${NC} openssl binary"
+    else
+        echo -e "  ${RED}●${NC} openssl binary ${DIM}(not built)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Chatbot Library:${NC} (source: ${CHATBOT_SOURCE})"
+
+    if [[ -f "${chatbot_dir}/VERSION" ]]; then
+        local sync_time
+        sync_time=$(grep "synced=" "${chatbot_dir}/VERSION" | cut -d= -f2)
+        echo -e "  ${DIM}Last synced:${NC} ${sync_time}"
+    fi
+
+    if [[ -f "${chatbot_dir}/chatbot.lua" ]]; then
+        echo -e "  ${GREEN}●${NC} chatbot.lua"
+    else
+        echo -e "  ${RED}●${NC} chatbot.lua ${DIM}(not synced)${NC}"
+    fi
+
+    if [[ -d "${chatbot_dir}/libs/fuzzy-computing" ]]; then
+        echo -e "  ${GREEN}●${NC} libs/fuzzy-computing/"
+    else
+        echo -e "  ${RED}●${NC} libs/fuzzy-computing/ ${DIM}(not synced)${NC}"
+    fi
+
+    if [[ -d "${chatbot_dir}/core" ]]; then
+        echo -e "  ${GREEN}●${NC} core/"
+    else
+        echo -e "  ${RED}●${NC} core/ ${DIM}(not synced)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}NixOS Compatibility:${NC}"
+
+    # Check for gcc lib
+    local gcc_lib_path=""
+    gcc_lib_path=$(find /nix/store -maxdepth 1 -name "*gcc*-lib" -type d 2>/dev/null | head -1)
+    if [[ -n "$gcc_lib_path" ]] && [[ -f "${gcc_lib_path}/lib/libstdc++.so.6" ]]; then
+        echo -e "  ${GREEN}●${NC} libstdc++.so.6 found"
+    else
+        echo -e "  ${YELLOW}●${NC} libstdc++.so.6 ${DIM}(native modules may fail)${NC}"
+    fi
+
+    # Check for Chromium
+    local chromium_path=""
+    if command -v chromium &>/dev/null; then
+        chromium_path=$(which chromium)
+        echo -e "  ${GREEN}●${NC} Chromium: ${chromium_path}"
+    elif command -v google-chrome-stable &>/dev/null; then
+        chromium_path=$(which google-chrome-stable)
+        echo -e "  ${GREEN}●${NC} Chrome: ${chromium_path}"
+    else
+        echo -e "  ${YELLOW}●${NC} Chromium ${DIM}(puppeteer will download its own)${NC}"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Environment Script:${NC}"
+    if [[ -f "${LIBS_DIR}/env.sh" ]]; then
+        echo -e "  ${GREEN}●${NC} ${LIBS_DIR}/env.sh"
+        echo ""
+        echo -e "${BOLD}To use:${NC}"
+        echo -e "  source ${LIBS_DIR}/env.sh"
+    else
+        echo -e "  ${YELLOW}●${NC} Not generated ${DIM}(run: ./build-deps env)${NC}"
+    fi
+}
+
+# =============================================================================
+# VERIFY
+# =============================================================================
+
+verify_built() {
+    log header "Verifying Built Dependencies"
+
+    local ok=true
+
+    if [[ "$BUILD_OPENSSL" == "true" ]]; then
+        log step "Verifying OpenSSL..."
+
+        if [[ -x "${openssl_dir}/bin/openssl" ]]; then
+            local version
+            version=$("${openssl_dir}/bin/openssl" version 2>/dev/null || echo "unknown")
+            log success "OpenSSL: ${version}"
+        else
+            log error "OpenSSL binary not found"
+            ok=false
+        fi
+
+        local ssl_lib_dir
+        ssl_lib_dir=$(get_openssl_lib_dir)
+
+        if [[ -f "${ssl_lib_dir}/libssl.so" ]] || [[ -f "${ssl_lib_dir}/libssl.a" ]]; then
+            log success "libssl found in ${ssl_lib_dir}"
+        else
+            log error "libssl not found"
+            ok=false
+        fi
+
+        if [[ -f "${ssl_lib_dir}/libcrypto.so" ]] || [[ -f "${ssl_lib_dir}/libcrypto.a" ]]; then
+            log success "libcrypto found"
+        else
+            log error "libcrypto not found"
+            ok=false
+        fi
+    fi
+
+    if [[ "$BUILD_PRISMA_ENGINES" == "true" ]]; then
+        log step "Verifying Prisma engines..."
+
+        if [[ -x "${prisma_engines_dir}/schema-engine" ]]; then
+            if "${prisma_engines_dir}/schema-engine" --version &>/dev/null; then
+                log success "schema-engine works"
+            else
+                log warn "schema-engine exists but may not work correctly"
+            fi
+        else
+            log error "schema-engine not found"
+            ok=false
+        fi
+
+        if [[ -x "${prisma_engines_dir}/query-engine" ]]; then
+            if "${prisma_engines_dir}/query-engine" --version &>/dev/null; then
+                log success "query-engine works"
+            else
+                log warn "query-engine exists but may not work correctly"
+            fi
+        else
+            log error "query-engine not found"
+            ok=false
+        fi
+
+        if [[ -f "${prisma_engines_dir}/libquery_engine.node" ]]; then
+            log success "libquery_engine.node exists"
+        else
+            log error "libquery_engine.node not found"
+            ok=false
+        fi
+    fi
+
+    if [[ "$ok" == "true" ]]; then
+        log success "All dependencies verified"
+    else
+        log error "Some dependencies failed verification"
+        return 1
+    fi
+}
+
+# =============================================================================
+# CLEAN
+# =============================================================================
+
+clean_build() {
+    log header "Cleaning Build Artifacts"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would remove: $BUILD_DIR"
+        return 0
+    fi
+
+    if [[ -d "$BUILD_DIR" ]]; then
+        log step "Removing build directory..."
+        rm -rf "$BUILD_DIR"
+        log success "Build directory cleaned"
+    else
+        log info "Build directory doesn't exist"
+    fi
+}
+
+clean_all() {
+    log header "Cleaning All Built Dependencies"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would remove: $LIBS_DIR"
+        return 0
+    fi
+
+    read -p "This will remove all built dependencies. Continue? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log info "Aborted"
+        return 0
+    fi
+
+    if [[ -d "$LIBS_DIR" ]]; then
+        rm -rf "$LIBS_DIR"
+        log success "All dependencies cleaned"
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    load_config
+    parse_args "$@"
+    setup_colors
+    init_paths
+
+    case "$COMMAND" in
+        all)
+            verify_prerequisites || exit 1
+            build_openssl || exit 1
+            build_prisma_engines || exit 1
+            sync_chatbot || exit 1
+
+            if [[ "$KEEP_BUILD_DIR" != "true" ]]; then
+                clean_build
+            fi
+
+            # Regenerate env script with all built components
+            generate_env_script
+
+            show_status
+            ;;
+        openssl)
+            verify_prerequisites || exit 1
+            build_openssl || exit 1
+
+            if [[ "$KEEP_BUILD_DIR" != "true" ]]; then
+                clean_build
+            fi
+
+            # Regenerate env script
+            generate_env_script
+            ;;
+        prisma)
+            verify_prerequisites || exit 1
+            build_prisma_engines || exit 1
+
+            if [[ "$KEEP_BUILD_DIR" != "true" ]]; then
+                clean_build
+            fi
+
+            # Regenerate env script
+            generate_env_script
+            ;;
+        chatbot)
+            sync_chatbot || exit 1
+            generate_env_script
+            show_status
+            ;;
+        env)
+            mkdir -p "$LIBS_DIR"
+            generate_env_script
+            show_status
+            ;;
+        status)
+            show_status
+            ;;
+        clean)
+            clean_build
+            ;;
+        verify)
+            verify_built
+            ;;
+        *)
+            log error "Unknown command: $COMMAND"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

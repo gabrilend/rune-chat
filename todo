@@ -1,0 +1,46 @@
+if an enemy NPC is spawned in the water or in an unpassable part of the map, then they are destroyed
+with no loot and the spawn chance is wasted.
+
+if a friendly NPC is to be spawned in the water or in an unpassable part of the map, then a new spot
+is chosen and the NPC has a gift for the person they spawned for.
+
+ 3. Spawn B at random walkable point in radius 8-15 tiles around player
+
+- the NPC should spawn on the exact distance that is the black border of the map.
+
+
+ 4. Set B to walk toward the player (queueWaypoint to player's position)
+
+- do not walk toward player, walk toward 3-8 tiles away, in a radius around them (sometimes you just
+  miss each other) - when reaching the end of a waypoint destination, continue in the same rough
+  direction until encountering something to do. if two of the same type of NPC are in range when
+  reaching the end of a waypoint, they merge and gain +1 level from the higher of the two. But only
+  if no players (or bots) are within sight range.
+
+ spawnAtRandomPoint(player, npcTypeId, radius) helper:
+
+ 1. Pick random angle (0-2PI) and distance (min 8, max radius)
+ 2. Calculate x = player.x + cos(angle) * dist, z = player.z + sin(angle) * dist
+ 3. Validate the tile is walkable using collision flags (!isFlagged(x, z, level,
+ CollisionFlag.WALK_BLOCKED))
+ 4. Retry up to 10 times if blocked
+ 5. Create new Npc(...) with EntityLifeCycle.DESPAWN
+ 6. Call World.addNpc(npc, 500) (auto-despawn after ~3.5 minutes if no interaction)
+
+- don't despawn NPCs over time, wait until they encounter death by combat. let them wander.
+
+the city guards should always spawn in their default locations (and others? like inside of the city
+going on patrol walk down the streets in groups of two or three)
+
+the kings should attract monsters from outside of their town, who the guards intercept
+
+the level of the monsters depends on the average level of the players inside of their castle.
+minimum, the highest level of their guards. but, they don't heal, so any damage done is damage done.
+
+runecrafting altars should enchant whatever items the user is wearing. the enchantment spell is
+chosen based on the nature of the altar in question - an altar in the wind and ice would probably
+enchant diamond jewelry, while the sapphire altar might be underwater. Each of the elemental altars
+have conditions that describe their home and nature, and the enchantment spell for them is chosen
+based on this character.
+
+however, when a character dies, all their equipment becomes unenchanted.

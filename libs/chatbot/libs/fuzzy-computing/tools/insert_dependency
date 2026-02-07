@@ -1,0 +1,928 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Tool metadata
+local tool_info = {
+    name = "insert_dependency",
+    description = "Get boilerplate code for using a library from the libs/ directory. " ..
+                  "Returns the exact require statements and setup code needed. " ..
+                  "Use this before writing code that needs JSON, HTTP, sockets, readline, graphics, colors, or LLM API functionality.",
+    parameters = {
+        type = "object",
+        properties = {
+            library = {
+                type = "string",
+                enum = {"dkjson", "socket", "socket.http", "ltn12", "readline", "raylib", "ansicolors", "llm", "fuzzy-computing"},
+                description = "The library to import: 'dkjson' for JSON, 'socket' for TCP/UDP, 'socket.http' for HTTP requests, 'ltn12' for filters/sources/sinks, 'readline' for interactive input, 'raylib' for graphics/games, 'ansicolors' for terminal colors, 'llm' for Ollama LLM API calls, 'fuzzy-computing' for LLM chat client with tool calling"
+            },
+            language = {
+                type = "string",
+                enum = {"lua", "c"},
+                description = "Target language: 'lua' for direct use, 'c' for FFI/embedding instructions"
+            }
+        },
+        required = {"library", "language"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Library boilerplate definitions
+local libraries = {
+    dkjson = {
+        lua = [[
+-- JSON library (dkjson)
+local json = require("dkjson")
+
+-- Encode Lua table to JSON string
+local json_string = json.encode({
+    key = "value",
+    numbers = {1, 2, 3},
+    nested = {foo = "bar"}
+})
+
+-- Decode JSON string to Lua table
+local data, pos, err = json.decode(json_string)
+if err then
+    print("JSON decode error: " .. err)
+end
+
+-- Pretty print with indentation
+local pretty = json.encode(data, {indent = true})]],
+
+        c = [[
+-- Using dkjson from C requires embedding LuaJIT
+
+/* In C, you need to:
+   1. Initialize LuaJIT state
+   2. Set up package.path to find dkjson
+   3. Call Lua functions via the C API
+
+Example C code: */
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    // Set up package path
+    luaL_dostring(L, "package.path = 'libs/?.lua;' .. package.path");
+
+    // Load and use dkjson
+    luaL_dostring(L,
+        "local json = require('dkjson')\n"
+        "local data = json.decode('{\"key\": \"value\"}')\n"
+        "print(data.key)"
+    );
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile with: gcc -o myapp myapp.c -lluajit-5.1 -I/usr/include/luajit-2.1 */]]
+    },
+
+    socket = {
+        lua = [[
+-- Socket library (TCP/UDP)
+-- First set up paths for luasocket
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/luasocket/share/lua/5.1/?.lua;" .. package.path
+package.cpath = script_dir .. "libs/luasocket/lib/lua/5.1/?.so;" ..
+                script_dir .. "libs/luasocket/lib/lua/5.1/socket/?.so;" .. package.cpath
+
+local socket = require("socket")
+
+-- TCP client example
+local tcp = socket.tcp()
+tcp:settimeout(10)
+local ok, err = tcp:connect("example.com", 80)
+if ok then
+    tcp:send("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    local response = tcp:receive("*a")
+    tcp:close()
+end
+
+-- UDP example
+local udp = socket.udp()
+udp:setpeername("127.0.0.1", 12345)
+udp:send("Hello UDP")
+udp:close()
+
+-- Get current time with millisecond precision
+local time = socket.gettime()]],
+
+        c = [[
+-- Using luasocket from C requires embedding LuaJIT with the socket .so files
+
+/* The luasocket library has native .so components that must be loadable.
+   Set up both package.path (for .lua) and package.cpath (for .so) */
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    luaL_dostring(L,
+        "package.path = 'libs/luasocket/share/lua/5.1/?.lua;' .. package.path\n"
+        "package.cpath = 'libs/luasocket/lib/lua/5.1/?.so;' .. package.cpath\n"
+        "local socket = require('socket')\n"
+        "print('Socket version:', socket._VERSION)"
+    );
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile with: gcc -o myapp myapp.c -lluajit-5.1 -I/usr/include/luajit-2.1 -Wl,-rpath,libs/luasocket/lib/lua/5.1 */]]
+    },
+
+    ["socket.http"] = {
+        lua = [[
+-- HTTP client library
+-- First set up paths for luasocket
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/luasocket/share/lua/5.1/?.lua;" .. package.path
+package.cpath = script_dir .. "libs/luasocket/lib/lua/5.1/?.so;" ..
+                script_dir .. "libs/luasocket/lib/lua/5.1/socket/?.so;" .. package.cpath
+
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+
+-- Simple GET request
+local body, status_code, headers = http.request("http://example.com/")
+print("Status:", status_code)
+
+-- POST request with body
+local response = {}
+local body, status = http.request{
+    url = "http://example.com/api",
+    method = "POST",
+    headers = {
+        ["Content-Type"] = "application/json",
+        ["Content-Length"] = #post_data
+    },
+    source = ltn12.source.string(post_data),
+    sink = ltn12.sink.table(response)
+}
+local response_body = table.concat(response)]],
+
+        c = [[
+-- Using socket.http from C requires embedding LuaJIT
+
+/* Same setup as socket, but require socket.http instead */
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    luaL_dostring(L,
+        "package.path = 'libs/luasocket/share/lua/5.1/?.lua;' .. package.path\n"
+        "package.cpath = 'libs/luasocket/lib/lua/5.1/?.so;' .. package.cpath\n"
+        "local http = require('socket.http')\n"
+        "local body, code = http.request('http://example.com/')\n"
+        "print('Status:', code)"
+    );
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile with: gcc -o myapp myapp.c -lluajit-5.1 -I/usr/include/luajit-2.1 */]]
+    },
+
+    ltn12 = {
+        lua = [[
+-- LTN12 - Filters, Sources, and Sinks for streaming data
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/luasocket/share/lua/5.1/?.lua;" .. package.path
+
+local ltn12 = require("ltn12")
+
+-- Source: produces data
+local str_source = ltn12.source.string("Hello, World!")
+local file_source = ltn12.source.file(io.open("input.txt", "r"))
+
+-- Sink: consumes data
+local output = {}
+local table_sink = ltn12.sink.table(output)  -- collects chunks into table
+local file_sink = ltn12.sink.file(io.open("output.txt", "w"))
+
+-- Pump: moves data from source to sink
+ltn12.pump.all(str_source, table_sink)
+local result = table.concat(output)
+
+-- Chain filters (e.g., for encoding)
+local mime = require("mime")
+local filtered_source = ltn12.source.chain(
+    ltn12.source.string("data to encode"),
+    mime.encode("base64")
+)]],
+
+        c = [[
+-- LTN12 is pure Lua, use it via embedded LuaJIT
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    luaL_dostring(L,
+        "package.path = 'libs/luasocket/share/lua/5.1/?.lua;' .. package.path\n"
+        "local ltn12 = require('ltn12')\n"
+        "local output = {}\n"
+        "ltn12.pump.all(ltn12.source.string('Hello'), ltn12.sink.table(output))\n"
+        "print(table.concat(output))"
+    );
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile with: gcc -o myapp myapp.c -lluajit-5.1 -I/usr/include/luajit-2.1 */]]
+    },
+
+    readline = {
+        lua = [[
+-- Readline - Interactive line input with history and editing
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/?.lua;" .. package.path
+
+local rl = require("readline")
+
+-- Read a single line with prompt
+local input = rl.readline("Enter command: ")
+
+-- Read with continuation prompt (for multiline)
+local input = rl.readline(
+    ">>> ",           -- primary prompt
+    "... "            -- continuation prompt (when line ends with \)
+)
+
+-- Input is nil on EOF (Ctrl+D)
+if input then
+    print("You entered: " .. input)
+end
+
+-- History is managed automatically
+-- Use up/down arrows to navigate history
+-- Supports: cursor movement, backspace, delete, home, end]],
+
+        c = [[
+-- Readline is pure Lua with terminal escape codes
+-- For C programs, either embed LuaJIT or use GNU readline directly
+
+/* Option 1: Embed LuaJIT and use the Lua readline */
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    luaL_dostring(L,
+        "package.path = 'libs/?.lua;' .. package.path\n"
+        "local rl = require('readline')\n"
+        "local input = rl.readline('> ')\n"
+        "print('Got:', input)"
+    );
+
+    lua_close(L);
+    return 0;
+}
+
+/* Option 2: Use GNU readline directly in C */
+#include <stdio.h>
+#include <stdlib.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+
+int main(void) {
+    char *input = readline("Enter command: ");
+    if (input) {
+        add_history(input);  // Add to history
+        printf("You entered: %s\n", input);
+        free(input);
+    }
+    return 0;
+}
+
+/* Compile Option 2 with: gcc -o myapp myapp.c -lreadline */]]
+    },
+
+    raylib = {
+        lua = [=[
+-- Raylib graphics library via LuaJIT FFI
+-- Requires: libraylib.so compiled and accessible
+local ffi = require("ffi")
+
+-- Load raylib shared library
+local raylib = ffi.load("raylib")
+
+-- Define the raylib functions and types we need
+ffi.cdef[[
+    // Core types
+    typedef struct Vector2 { float x, y; } Vector2;
+    typedef struct Vector3 { float x, y, z; } Vector3;
+    typedef struct Color { unsigned char r, g, b, a; } Color;
+    typedef struct Rectangle { float x, y, width, height; } Rectangle;
+    typedef struct Camera2D {
+        Vector2 offset, target;
+        float rotation, zoom;
+    } Camera2D;
+
+    // Window functions
+    void InitWindow(int width, int height, const char *title);
+    void CloseWindow(void);
+    bool WindowShouldClose(void);
+    void SetTargetFPS(int fps);
+
+    // Drawing functions
+    void BeginDrawing(void);
+    void EndDrawing(void);
+    void ClearBackground(Color color);
+
+    // Shapes
+    void DrawRectangle(int x, int y, int width, int height, Color color);
+    void DrawRectangleRec(Rectangle rec, Color color);
+    void DrawCircle(int centerX, int centerY, float radius, Color color);
+    void DrawLine(int startX, int startY, int endX, int endY, Color color);
+
+    // Text
+    void DrawText(const char *text, int x, int y, int fontSize, Color color);
+    void DrawFPS(int x, int y);
+
+    // Input
+    bool IsKeyPressed(int key);
+    bool IsKeyDown(int key);
+    bool IsMouseButtonPressed(int button);
+    Vector2 GetMousePosition(void);
+]]
+
+-- Color constants
+local RAYWHITE = ffi.new("Color", 245, 245, 245, 255)
+local BLACK    = ffi.new("Color", 0, 0, 0, 255)
+local RED      = ffi.new("Color", 230, 41, 55, 255)
+local GREEN    = ffi.new("Color", 0, 228, 48, 255)
+local BLUE     = ffi.new("Color", 0, 121, 241, 255)
+
+-- Key constants
+local KEY_ESCAPE = 256
+local KEY_SPACE  = 32
+local KEY_RIGHT  = 262
+local KEY_LEFT   = 263
+local KEY_DOWN   = 264
+local KEY_UP     = 265
+
+-- Example usage:
+raylib.InitWindow(800, 450, "raylib [core] example - LuaJIT FFI")
+raylib.SetTargetFPS(60)
+
+while not raylib.WindowShouldClose() do
+    -- Update
+    -- ...
+
+    -- Draw
+    raylib.BeginDrawing()
+    raylib.ClearBackground(RAYWHITE)
+    raylib.DrawText("Hello from LuaJIT!", 190, 200, 20, BLACK)
+    raylib.DrawFPS(10, 10)
+    raylib.EndDrawing()
+end
+
+raylib.CloseWindow()]=],
+
+        c = [=[
+-- Raylib graphics library (native C)
+-- Source located at: libs/raylib-wayland/
+
+#include "raylib.h"
+
+int main(void)
+{
+    // Initialization
+    const int screenWidth = 800;
+    const int screenHeight = 450;
+
+    InitWindow(screenWidth, screenHeight, "raylib example");
+    SetTargetFPS(60);
+
+    // Main game loop
+    while (!WindowShouldClose())
+    {
+        // Update
+        // ...
+
+        // Draw
+        BeginDrawing();
+            ClearBackground(RAYWHITE);
+            DrawText("Hello, raylib!", 190, 200, 20, LIGHTGRAY);
+            DrawFPS(10, 10);
+
+            // Draw shapes
+            DrawRectangle(100, 100, 200, 80, RED);
+            DrawCircle(400, 300, 50, BLUE);
+            DrawLine(0, 0, screenWidth, screenHeight, GREEN);
+        EndDrawing();
+    }
+
+    // De-Initialization
+    CloseWindow();
+    return 0;
+}
+
+/* Build raylib first (from libs/raylib-wayland/):
+   cd libs/raylib-wayland/src
+   make PLATFORM=PLATFORM_DESKTOP GRAPHICS=GRAPHICS_API_OPENGL_33
+
+   Then compile your program:
+   gcc -o myapp myapp.c -I libs/raylib-wayland/src -L libs/raylib-wayland/src -lraylib -lm -lpthread -ldl -lGL -lX11
+
+   For Wayland:
+   gcc -o myapp myapp.c -I libs/raylib-wayland/src -L libs/raylib-wayland/src -lraylib -lm -lpthread -ldl -lGL -lwayland-client -lwayland-egl -lxkbcommon
+*/]=]
+    },
+
+    ansicolors = {
+        lua = [[
+-- ANSI Terminal Colors
+-- Escape sequences for colored terminal output
+
+local colors = {
+    -- Reset
+    reset     = "\27[0m",
+
+    -- Regular colors
+    black     = "\27[30m",
+    red       = "\27[31m",
+    green     = "\27[32m",
+    yellow    = "\27[33m",
+    blue      = "\27[34m",
+    magenta   = "\27[35m",
+    cyan      = "\27[36m",
+    white     = "\27[37m",
+
+    -- Bright/bold colors
+    bright_black   = "\27[90m",
+    bright_red     = "\27[91m",
+    bright_green   = "\27[92m",
+    bright_yellow  = "\27[93m",
+    bright_blue    = "\27[94m",
+    bright_magenta = "\27[95m",
+    bright_cyan    = "\27[96m",
+    bright_white   = "\27[97m",
+
+    -- Background colors
+    bg_black   = "\27[40m",
+    bg_red     = "\27[41m",
+    bg_green   = "\27[42m",
+    bg_yellow  = "\27[43m",
+    bg_blue    = "\27[44m",
+    bg_magenta = "\27[45m",
+    bg_cyan    = "\27[46m",
+    bg_white   = "\27[47m",
+
+    -- Styles
+    bold      = "\27[1m",
+    dim       = "\27[2m",
+    italic    = "\27[3m",
+    underline = "\27[4m",
+    blink     = "\27[5m",
+    reverse   = "\27[7m",
+    hidden    = "\27[8m",
+    strike    = "\27[9m",
+}
+
+-- Helper function to colorize text
+local function colorize(text, color)
+    return colors[color] .. text .. colors.reset
+end
+
+-- Example usage:
+print(colors.red .. "Error: " .. colors.reset .. "Something went wrong")
+print(colors.bold .. colors.green .. "Success!" .. colors.reset)
+print(colorize("Warning", "yellow"))]],
+
+        c = [[
+/* ANSI Terminal Colors for C */
+
+#ifndef ANSI_COLORS_H
+#define ANSI_COLORS_H
+
+/* Reset */
+#define ANSI_RESET     "\x1b[0m"
+
+/* Regular colors */
+#define ANSI_BLACK     "\x1b[30m"
+#define ANSI_RED       "\x1b[31m"
+#define ANSI_GREEN     "\x1b[32m"
+#define ANSI_YELLOW    "\x1b[33m"
+#define ANSI_BLUE      "\x1b[34m"
+#define ANSI_MAGENTA   "\x1b[35m"
+#define ANSI_CYAN      "\x1b[36m"
+#define ANSI_WHITE     "\x1b[37m"
+
+/* Bright colors */
+#define ANSI_BRIGHT_BLACK   "\x1b[90m"
+#define ANSI_BRIGHT_RED     "\x1b[91m"
+#define ANSI_BRIGHT_GREEN   "\x1b[92m"
+#define ANSI_BRIGHT_YELLOW  "\x1b[93m"
+#define ANSI_BRIGHT_BLUE    "\x1b[94m"
+#define ANSI_BRIGHT_MAGENTA "\x1b[95m"
+#define ANSI_BRIGHT_CYAN    "\x1b[96m"
+#define ANSI_BRIGHT_WHITE   "\x1b[97m"
+
+/* Background colors */
+#define ANSI_BG_BLACK   "\x1b[40m"
+#define ANSI_BG_RED     "\x1b[41m"
+#define ANSI_BG_GREEN   "\x1b[42m"
+#define ANSI_BG_YELLOW  "\x1b[43m"
+#define ANSI_BG_BLUE    "\x1b[44m"
+#define ANSI_BG_MAGENTA "\x1b[45m"
+#define ANSI_BG_CYAN    "\x1b[46m"
+#define ANSI_BG_WHITE   "\x1b[47m"
+
+/* Styles */
+#define ANSI_BOLD      "\x1b[1m"
+#define ANSI_DIM       "\x1b[2m"
+#define ANSI_ITALIC    "\x1b[3m"
+#define ANSI_UNDERLINE "\x1b[4m"
+#define ANSI_BLINK     "\x1b[5m"
+#define ANSI_REVERSE   "\x1b[7m"
+#define ANSI_HIDDEN    "\x1b[8m"
+#define ANSI_STRIKE    "\x1b[9m"
+
+#endif /* ANSI_COLORS_H */
+
+/* Example usage: */
+#include <stdio.h>
+
+int main(void) {
+    printf(ANSI_RED "Error: " ANSI_RESET "Something went wrong\n");
+    printf(ANSI_BOLD ANSI_GREEN "Success!" ANSI_RESET "\n");
+    printf(ANSI_YELLOW "Warning" ANSI_RESET "\n");
+    return 0;
+}]]
+    },
+
+    llm = {
+        lua = [=[
+-- LLM API Client (Ollama)
+-- For making requests to local Ollama server
+
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/luasocket/share/lua/5.1/?.lua;" ..
+               script_dir .. "libs/?.lua;" .. package.path
+package.cpath = script_dir .. "libs/luasocket/lib/lua/5.1/?.so;" ..
+                script_dir .. "libs/luasocket/lib/lua/5.1/socket/?.so;" .. package.cpath
+
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+local json = require("dkjson")
+
+-- Configuration
+local OLLAMA_HOST = "localhost"
+local OLLAMA_PORT = 11434
+local MODEL = "llama3"
+
+-- Send a chat completion request
+local function chat(messages, model)
+    model = model or MODEL
+    local url = string.format("http://%s:%d/api/chat", OLLAMA_HOST, OLLAMA_PORT)
+
+    local request_body = json.encode({
+        model = model,
+        messages = messages,
+        stream = false
+    })
+
+    local response = {}
+    local _, status_code = http.request{
+        url = url,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = #request_body
+        },
+        source = ltn12.source.string(request_body),
+        sink = ltn12.sink.table(response)
+    }
+
+    if status_code ~= 200 then
+        return nil, "HTTP error: " .. tostring(status_code)
+    end
+
+    local result = json.decode(table.concat(response))
+    return result.message.content, nil
+end
+
+-- Example usage:
+local messages = {
+    {role = "system", content = "You are a helpful assistant."},
+    {role = "user", content = "Hello!"}
+}
+
+local response, err = chat(messages)
+if response then
+    print("Assistant: " .. response)
+else
+    print("Error: " .. err)
+end]=],
+
+        c = [=[
+/* LLM API Client for C (via embedded LuaJIT)
+   For direct C HTTP, consider libcurl instead */
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include <stdio.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    const char *lua_code =
+        "package.path = 'libs/luasocket/share/lua/5.1/?.lua;libs/?.lua;' .. package.path\n"
+        "package.cpath = 'libs/luasocket/lib/lua/5.1/?.so;' .. package.cpath\n"
+        "local http = require('socket.http')\n"
+        "local ltn12 = require('ltn12')\n"
+        "local json = require('dkjson')\n"
+        "\n"
+        "local function chat(prompt)\n"
+        "    local body = json.encode({\n"
+        "        model = 'llama3',\n"
+        "        messages = {{role='user', content=prompt}},\n"
+        "        stream = false\n"
+        "    })\n"
+        "    local resp = {}\n"
+        "    http.request{\n"
+        "        url = 'http://localhost:11434/api/chat',\n"
+        "        method = 'POST',\n"
+        "        headers = {['Content-Type']='application/json', ['Content-Length']=#body},\n"
+        "        source = ltn12.source.string(body),\n"
+        "        sink = ltn12.sink.table(resp)\n"
+        "    }\n"
+        "    return json.decode(table.concat(resp)).message.content\n"
+        "end\n"
+        "\n"
+        "print(chat('Hello!'))\n";
+
+    if (luaL_dostring(L, lua_code) != 0) {
+        fprintf(stderr, "Error: %s\n", lua_tostring(L, -1));
+    }
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile: gcc -o llm_client llm_client.c -lluajit-5.1 -I/usr/include/luajit-2.1 */
+
+/* Alternative: Pure C with libcurl */
+/*
+#include <curl/curl.h>
+#include <string.h>
+
+int main(void) {
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        const char *data = "{\"model\":\"llama3\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}],\"stream\":false}";
+
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:11434/api/chat");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+    }
+    return 0;
+}
+// Compile: gcc -o llm_client llm_client.c -lcurl
+*/]=]
+    },
+
+    ["fuzzy-computing"] = {
+        lua = [=[
+-- fuzzy-computing: LLM Chat Client with Tool Calling
+-- A library for building LLM-powered applications with function calling
+
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "libs/fuzzy-computing/?.lua;" ..
+               script_dir .. "libs/luasocket/share/lua/5.1/?.lua;" ..
+               script_dir .. "libs/?.lua;" .. package.path
+package.cpath = script_dir .. "libs/luasocket/lib/lua/5.1/?.so;" ..
+                script_dir .. "libs/luasocket/lib/lua/5.1/socket/?.so;" .. package.cpath
+
+local ChatClient = require("chat_client")
+
+-- Create a new chat client
+-- Config can override defaults from libs/fuzzy-computing/config/chat_config.lua
+local chat = ChatClient.new({
+    host = "localhost",      -- Ollama server host
+    port = 11434,            -- Ollama server port
+    model = "llama3",        -- Model to use
+    tools_dir = "tools",     -- Directory containing tool executables
+    think = true,            -- Enable thinking mode if model supports it
+})
+
+-- Set system prompt
+chat:set_system_prompt("You are a helpful assistant with access to tools.")
+
+-- Send a message and get response (handles tool calls automatically)
+local response = chat:chat("Hello! What tools do you have available?")
+print(response)
+
+-- Access message history
+for _, msg in ipairs(chat.messages) do
+    print(msg.role .. ": " .. (msg.content or "[tool call]"))
+end
+
+-- Stream responses (callback for each chunk)
+chat:chat_stream("Tell me a story", function(chunk)
+    io.write(chunk)
+    io.flush()
+end)
+
+-- Reset conversation
+chat:reset()]=],
+
+        c = [=[
+-- fuzzy-computing is a pure Lua library
+-- For C integration, embed LuaJIT and load the library
+
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include <stdio.h>
+
+int main(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    const char *lua_code =
+        "package.path = 'libs/fuzzy-computing/?.lua;libs/luasocket/share/lua/5.1/?.lua;libs/?.lua;' .. package.path\n"
+        "package.cpath = 'libs/luasocket/lib/lua/5.1/?.so;' .. package.cpath\n"
+        "\n"
+        "local ChatClient = require('chat_client')\n"
+        "local chat = ChatClient.new({\n"
+        "    host = 'localhost',\n"
+        "    port = 11434,\n"
+        "    model = 'llama3'\n"
+        "})\n"
+        "\n"
+        "chat:set_system_prompt('You are a helpful assistant.')\n"
+        "local response = chat:chat('Hello!')\n"
+        "print(response)\n";
+
+    if (luaL_dostring(L, lua_code) != 0) {
+        fprintf(stderr, "Error: %s\n", lua_tostring(L, -1));
+    }
+
+    lua_close(L);
+    return 0;
+}
+
+/* Compile: gcc -o chat_app chat_app.c -lluajit-5.1 -I/usr/include/luajit-2.1 */]=]
+    }
+}
+
+-- Load config for library sources
+local config_loader_ok, config_loader = pcall(require, "chat_config_loader")
+local sources = {}
+if config_loader_ok then
+    local config = config_loader.load_config(script_dir .. "../")
+    sources = config.sources or {}
+end
+
+-- Helper to check if a path exists
+local function path_exists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    -- Check if it's a directory
+    local ok, _, code = os.rename(path, path)
+    if ok or code == 13 then  -- 13 = permission denied (exists but can't rename)
+        return true
+    end
+    return false
+end
+
+-- Get project root (go up from script_dir which is libs/fuzzy-computing/tools/)
+local project_root = script_dir:match("(.*/)[^/]+/[^/]+/[^/]+/$") or "./"
+
+-- Validate library exists at its source path
+local function validate_library(lib_name)
+    local source_path = sources[lib_name]
+    if not source_path then
+        return true, nil  -- No source configured, skip validation
+    end
+
+    -- Handle relative paths (relative to project root)
+    local full_path = source_path
+    if not source_path:match("^/") then
+        full_path = project_root .. source_path
+    end
+
+    if path_exists(full_path) then
+        return true, full_path
+    else
+        return false, full_path
+    end
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local library = params.library
+local language = params.language
+
+if not library or not language then
+    print(json.encode({success = false, error = "Missing required parameters: library and language"}))
+    os.exit(1)
+end
+
+local lib_data = libraries[library]
+if not lib_data then
+    local available = {}
+    for k, _ in pairs(libraries) do
+        table.insert(available, k)
+    end
+    print(json.encode({
+        success = false,
+        error = "Unknown library: " .. library,
+        available_libraries = available
+    }))
+    os.exit(1)
+end
+
+local boilerplate = lib_data[language]
+if not boilerplate then
+    print(json.encode({
+        success = false,
+        error = "Language '" .. language .. "' not supported for library '" .. library .. "'",
+        available_languages = {"lua", "c"}
+    }))
+    os.exit(1)
+end
+
+-- Validate the library exists at its configured source path
+local exists, checked_path = validate_library(library)
+local warning = nil
+local source_info = nil
+
+if checked_path then
+    source_info = {
+        configured_path = sources[library],
+        resolved_path = checked_path,
+        exists = exists
+    }
+    if not exists then
+        warning = "Library '" .. library .. "' not found at configured path: " .. checked_path ..
+                  ". You may need to install it or update the path in chat_config.lua sources."
+    end
+end
+
+print(json.encode({
+    success = true,
+    library = library,
+    language = language,
+    boilerplate = boilerplate,
+    message = "Use the following code to import " .. library .. " in " .. language,
+    source = source_info,
+    warning = warning
+}))

@@ -1,0 +1,915 @@
+#!/usr/bin/env bash
+#
+# rs-sdk update script
+# Checks for and applies updates to the RuneScape SDK
+#
+
+set -e
+
+# =============================================================================
+# LOCAL ENVIRONMENT SETUP
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIBS_ENV="${SCRIPT_DIR}/../libs/env.sh"
+
+# Source local dependencies environment if available
+if [[ -f "$LIBS_ENV" ]]; then
+    source "$LIBS_ENV" 2>/dev/null || true
+fi
+
+# =============================================================================
+# DEFAULTS (overridden by config file, then by command line flags)
+# =============================================================================
+
+PROJECT_ROOT="/home/ritz/programming/ai-stuff/runescape/rs-sdk"
+UPDATE_REPO=true
+UPDATE_ROOT_DEPS=true
+UPDATE_ENGINE_DEPS=true
+UPDATE_WEBCLIENT_DEPS=true
+UPDATE_GATEWAY_DEPS=true
+REBUILD_ENGINE_CONTENT=true
+REBUILD_WEBCLIENT=true
+COPY_WEBCLIENT_ASSETS=true
+RUN_MIGRATIONS=true
+DB_BACKEND=sqlite
+GIT_REMOTE="origin"
+GIT_BRANCH="main"
+GIT_STASH=true
+CHECK_ONLY=false
+FORCE_UPDATE=false
+NIXOS_PRISMA_COMPAT=true
+PRISMA_IGNORE_CHECKSUM=true
+LOG_LEVEL=info
+COLOR_OUTPUT=true
+VERBOSE=false
+QUIET=false
+LOG_FILE=""
+
+# =============================================================================
+# UPDATE STATE TRACKING
+# =============================================================================
+
+declare -A UPDATE_AVAILABLE
+declare -A UPDATE_APPLIED
+UPDATES_NEEDED=()
+UPDATES_APPLIED=()
+
+# =============================================================================
+# COLOR DEFINITIONS
+# =============================================================================
+
+setup_colors() {
+    if [[ "$COLOR_OUTPUT" == "true" ]] && [[ -t 1 ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[0;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        BOLD='\033[1m'
+        DIM='\033[2m'
+        NC='\033[0m'
+    else
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BLUE=''
+        MAGENTA=''
+        CYAN=''
+        BOLD=''
+        DIM=''
+        NC=''
+    fi
+}
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+
+    [[ "$QUIET" == "true" ]] && [[ "$level" != "error" ]] && return
+
+    case "$level" in
+        debug)
+            [[ "$VERBOSE" != "true" ]] && return
+            echo -e "${DIM}[$timestamp]${NC} ${CYAN}[DEBUG]${NC} $message"
+            ;;
+        info)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}[INFO]${NC} $message"
+            ;;
+        warn)
+            echo -e "${DIM}[$timestamp]${NC} ${YELLOW}[WARN]${NC} $message"
+            ;;
+        error)
+            echo -e "${DIM}[$timestamp]${NC} ${RED}[ERROR]${NC} $message" >&2
+            ;;
+        success)
+            echo -e "${DIM}[$timestamp]${NC} ${GREEN}${BOLD}[OK]${NC} $message"
+            ;;
+        header)
+            echo -e "\n${BOLD}${BLUE}=== $message ===${NC}\n"
+            ;;
+        step)
+            echo -e "${BOLD}${MAGENTA}>>>${NC} $message"
+            ;;
+        update)
+            echo -e "  ${CYAN}↑${NC} $message"
+            ;;
+        current)
+            echo -e "  ${GREEN}✓${NC} $message ${DIM}(up to date)${NC}"
+            ;;
+    esac
+
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
+}
+
+# =============================================================================
+# CONFIG FILE LOADING
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/../config/update.conf"
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log debug "Loading config from $CONFIG_FILE"
+        while IFS='=' read -r key value; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+            if [[ -n "$key" ]] && [[ -n "$value" ]]; then
+                export "$key"="$value"
+            fi
+        done < <(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep '=')
+    fi
+}
+
+# =============================================================================
+# USAGE / HELP
+# =============================================================================
+
+show_help() {
+    cat << EOF
+${BOLD}rs-sdk update script${NC}
+
+${BOLD}USAGE:${NC}
+    $(basename "$0") [OPTIONS] [COMMAND]
+
+${BOLD}COMMANDS:${NC}
+    check           Check for updates without applying (default if --check-only)
+    apply           Apply all available updates (default)
+    repo            Update repository only
+    deps            Update dependencies only
+    build           Rebuild components only
+    all             Full update cycle
+
+${BOLD}COMPONENT OPTIONS:${NC}
+    --repo                      Update git repository
+    --no-repo                   Skip repository update
+    --deps                      Update all dependencies
+    --no-deps                   Skip dependency updates
+    --build                     Rebuild after update
+    --no-build                  Skip rebuild
+
+${BOLD}REPOSITORY OPTIONS:${NC}
+    --remote REMOTE             Git remote (default: origin)
+    --branch BRANCH             Git branch (default: main)
+    --stash                     Stash local changes before pull
+    --no-stash                  Don't stash local changes
+
+${BOLD}DEPENDENCY OPTIONS:${NC}
+    --root-deps                 Update root dependencies
+    --no-root-deps              Skip root dependencies
+    --engine-deps               Update engine dependencies
+    --no-engine-deps            Skip engine dependencies
+    --webclient-deps            Update webclient dependencies
+    --no-webclient-deps         Skip webclient dependencies
+    --gateway-deps              Update gateway dependencies
+    --no-gateway-deps           Skip gateway dependencies
+
+${BOLD}BUILD OPTIONS:${NC}
+    --engine-content            Rebuild engine content
+    --no-engine-content         Skip engine content rebuild
+    --webclient                 Rebuild webclient
+    --no-webclient              Skip webclient rebuild
+    --copy-assets               Copy webclient assets
+    --no-copy-assets            Skip copying assets
+
+${BOLD}DATABASE OPTIONS:${NC}
+    --migrate                   Run migrations after update
+    --no-migrate                Skip migrations
+    --db-backend BACKEND        Database backend: sqlite|mysql
+
+${BOLD}UPDATE BEHAVIOR:${NC}
+    -c, --check-only            Only check for updates, don't apply
+    -f, --force                 Force update even if up-to-date
+    --selective                 Interactive mode to select updates
+
+${BOLD}NIXOS OPTIONS:${NC}
+    --nixos-compat              Enable NixOS Prisma compatibility
+    --no-nixos-compat           Disable NixOS Prisma compatibility
+
+${BOLD}OUTPUT OPTIONS:${NC}
+    -v, --verbose               Verbose output
+    -q, --quiet                 Quiet mode (errors only)
+    --log-level LEVEL           Log level: debug|info|warn|error
+    --log-file FILE             Log to file
+    --no-color                  Disable colored output
+
+${BOLD}PATH OPTIONS:${NC}
+    --project-root DIR          Project root directory
+    --config FILE               Config file path
+
+${BOLD}OTHER OPTIONS:${NC}
+    -h, --help                  Show this help message
+    --version                   Show version
+    --dry-run                   Show what would be done
+    --dump-config               Dump current configuration
+    -y, --yes                   Skip confirmation prompts
+
+${BOLD}EXAMPLES:${NC}
+    $(basename "$0")                    # Check and apply all updates
+    $(basename "$0") check              # Only check for updates
+    $(basename "$0") --check-only       # Same as check
+    $(basename "$0") repo               # Update repository only
+    $(basename "$0") deps               # Update dependencies only
+    $(basename "$0") --force            # Force full update
+    $(basename "$0") --no-build         # Update without rebuilding
+
+EOF
+}
+
+show_version() {
+    echo "rs-sdk updater v1.0.0"
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+COMMAND="apply"
+DRY_RUN=false
+DUMP_CONFIG=false
+SKIP_CONFIRM=false
+SELECTIVE=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # Commands
+            check|apply|repo|deps|build|all)
+                COMMAND="$1"
+                shift
+                ;;
+
+            # Component options
+            --repo) UPDATE_REPO=true; shift ;;
+            --no-repo) UPDATE_REPO=false; shift ;;
+            --deps)
+                UPDATE_ROOT_DEPS=true
+                UPDATE_ENGINE_DEPS=true
+                UPDATE_WEBCLIENT_DEPS=true
+                UPDATE_GATEWAY_DEPS=true
+                shift
+                ;;
+            --no-deps)
+                UPDATE_ROOT_DEPS=false
+                UPDATE_ENGINE_DEPS=false
+                UPDATE_WEBCLIENT_DEPS=false
+                UPDATE_GATEWAY_DEPS=false
+                shift
+                ;;
+            --build)
+                REBUILD_ENGINE_CONTENT=true
+                REBUILD_WEBCLIENT=true
+                COPY_WEBCLIENT_ASSETS=true
+                shift
+                ;;
+            --no-build)
+                REBUILD_ENGINE_CONTENT=false
+                REBUILD_WEBCLIENT=false
+                COPY_WEBCLIENT_ASSETS=false
+                shift
+                ;;
+
+            # Repository options
+            --remote) GIT_REMOTE="$2"; shift 2 ;;
+            --branch) GIT_BRANCH="$2"; shift 2 ;;
+            --stash) GIT_STASH=true; shift ;;
+            --no-stash) GIT_STASH=false; shift ;;
+
+            # Dependency options
+            --root-deps) UPDATE_ROOT_DEPS=true; shift ;;
+            --no-root-deps) UPDATE_ROOT_DEPS=false; shift ;;
+            --engine-deps) UPDATE_ENGINE_DEPS=true; shift ;;
+            --no-engine-deps) UPDATE_ENGINE_DEPS=false; shift ;;
+            --webclient-deps) UPDATE_WEBCLIENT_DEPS=true; shift ;;
+            --no-webclient-deps) UPDATE_WEBCLIENT_DEPS=false; shift ;;
+            --gateway-deps) UPDATE_GATEWAY_DEPS=true; shift ;;
+            --no-gateway-deps) UPDATE_GATEWAY_DEPS=false; shift ;;
+
+            # Build options
+            --engine-content) REBUILD_ENGINE_CONTENT=true; shift ;;
+            --no-engine-content) REBUILD_ENGINE_CONTENT=false; shift ;;
+            --webclient) REBUILD_WEBCLIENT=true; shift ;;
+            --no-webclient) REBUILD_WEBCLIENT=false; shift ;;
+            --copy-assets) COPY_WEBCLIENT_ASSETS=true; shift ;;
+            --no-copy-assets) COPY_WEBCLIENT_ASSETS=false; shift ;;
+
+            # Database options
+            --migrate) RUN_MIGRATIONS=true; shift ;;
+            --no-migrate) RUN_MIGRATIONS=false; shift ;;
+            --db-backend) DB_BACKEND="$2"; shift 2 ;;
+
+            # Update behavior
+            -c|--check-only) CHECK_ONLY=true; shift ;;
+            -f|--force) FORCE_UPDATE=true; shift ;;
+            --selective) SELECTIVE=true; shift ;;
+
+            # NixOS options
+            --nixos-compat) NIXOS_PRISMA_COMPAT=true; shift ;;
+            --no-nixos-compat) NIXOS_PRISMA_COMPAT=false; shift ;;
+
+            # Output options
+            -v|--verbose) VERBOSE=true; shift ;;
+            -q|--quiet) QUIET=true; shift ;;
+            --log-level) LOG_LEVEL="$2"; shift 2 ;;
+            --log-file) LOG_FILE="$2"; shift 2 ;;
+            --no-color) COLOR_OUTPUT=false; shift ;;
+
+            # Path options
+            --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+            --config)
+                CONFIG_FILE="$2"
+                load_config
+                shift 2
+                ;;
+
+            # Other options
+            -h|--help) show_help; exit 0 ;;
+            --version) show_version; exit 0 ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --dump-config) DUMP_CONFIG=true; shift ;;
+            -y|--yes) SKIP_CONFIRM=true; shift ;;
+
+            -*)
+                log error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                log error "Unknown argument: $1"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# CONFIGURATION DUMP
+# =============================================================================
+
+dump_config() {
+    cat << EOF
+${BOLD}Current Configuration:${NC}
+
+${CYAN}Paths:${NC}
+  PROJECT_ROOT=${PROJECT_ROOT}
+
+${CYAN}Repository:${NC}
+  UPDATE_REPO=${UPDATE_REPO}
+  GIT_REMOTE=${GIT_REMOTE}
+  GIT_BRANCH=${GIT_BRANCH}
+  GIT_STASH=${GIT_STASH}
+
+${CYAN}Dependencies:${NC}
+  UPDATE_ROOT_DEPS=${UPDATE_ROOT_DEPS}
+  UPDATE_ENGINE_DEPS=${UPDATE_ENGINE_DEPS}
+  UPDATE_WEBCLIENT_DEPS=${UPDATE_WEBCLIENT_DEPS}
+  UPDATE_GATEWAY_DEPS=${UPDATE_GATEWAY_DEPS}
+
+${CYAN}Build:${NC}
+  REBUILD_ENGINE_CONTENT=${REBUILD_ENGINE_CONTENT}
+  REBUILD_WEBCLIENT=${REBUILD_WEBCLIENT}
+  COPY_WEBCLIENT_ASSETS=${COPY_WEBCLIENT_ASSETS}
+
+${CYAN}Database:${NC}
+  RUN_MIGRATIONS=${RUN_MIGRATIONS}
+  DB_BACKEND=${DB_BACKEND}
+
+${CYAN}Behavior:${NC}
+  CHECK_ONLY=${CHECK_ONLY}
+  FORCE_UPDATE=${FORCE_UPDATE}
+EOF
+}
+
+# =============================================================================
+# PRISMA ENVIRONMENT SETUP
+# =============================================================================
+
+setup_prisma_env() {
+    if [[ "$NIXOS_PRISMA_COMPAT" != "true" ]]; then
+        return
+    fi
+
+    # Local libs directory (built from source)
+    local local_prisma="${SCRIPT_DIR}/../libs/prisma-engines"
+
+    # Prefer locally built Prisma engines
+    if [[ -x "${local_prisma}/schema-engine" ]]; then
+        export PRISMA_SCHEMA_ENGINE_BINARY="${local_prisma}/schema-engine"
+    elif command -v schema-engine &> /dev/null; then
+        export PRISMA_SCHEMA_ENGINE_BINARY=$(which schema-engine)
+    fi
+
+    if [[ -x "${local_prisma}/query-engine" ]]; then
+        export PRISMA_QUERY_ENGINE_BINARY="${local_prisma}/query-engine"
+    elif command -v query-engine &> /dev/null; then
+        export PRISMA_QUERY_ENGINE_BINARY=$(which query-engine)
+    fi
+
+    if [[ -f "${local_prisma}/libquery_engine.node" ]]; then
+        export PRISMA_QUERY_ENGINE_LIBRARY="${local_prisma}/libquery_engine.node"
+    elif command -v query-engine &> /dev/null; then
+        local engine_dir
+        engine_dir=$(dirname "$(which query-engine)")
+        local lib_path="${engine_dir}/../lib/libquery_engine.node"
+        if [[ -f "$lib_path" ]]; then
+            export PRISMA_QUERY_ENGINE_LIBRARY="$lib_path"
+        fi
+    fi
+
+    if command -v prisma-fmt &> /dev/null; then
+        export PRISMA_FMT_BINARY=$(which prisma-fmt)
+    fi
+
+    if [[ "$PRISMA_IGNORE_CHECKSUM" == "true" ]]; then
+        export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
+    fi
+}
+
+# =============================================================================
+# CHECK FUNCTIONS
+# =============================================================================
+
+check_repo_updates() {
+    log step "Checking repository for updates..."
+
+    cd "$PROJECT_ROOT"
+
+    # Fetch without merging
+    git fetch "$GIT_REMOTE" "$GIT_BRANCH" --quiet 2>/dev/null || {
+        log warn "Failed to fetch from remote"
+        return 1
+    }
+
+    local local_head
+    local remote_head
+    local_head=$(git rev-parse HEAD)
+    remote_head=$(git rev-parse "${GIT_REMOTE}/${GIT_BRANCH}")
+
+    if [[ "$local_head" != "$remote_head" ]]; then
+        local behind
+        behind=$(git rev-list --count HEAD.."${GIT_REMOTE}/${GIT_BRANCH}")
+        log update "Repository: ${behind} commits behind"
+        UPDATE_AVAILABLE[repo]="$behind commits"
+        UPDATES_NEEDED+=("repo")
+        return 0
+    else
+        log current "Repository"
+        UPDATE_AVAILABLE[repo]=""
+        return 1
+    fi
+}
+
+check_lockfile_changes() {
+    local dir="$1"
+    local name="$2"
+    local lockfile="${dir}/bun.lock"
+
+    if [[ ! -f "$lockfile" ]]; then
+        log debug "No lockfile found in $dir"
+        return 1
+    fi
+
+    cd "$dir"
+
+    # Check if lockfile has changed from remote
+    if git diff --quiet "${GIT_REMOTE}/${GIT_BRANCH}" -- bun.lock 2>/dev/null; then
+        log current "$name dependencies"
+        UPDATE_AVAILABLE[$name]=""
+        return 1
+    else
+        log update "$name: lockfile changed"
+        UPDATE_AVAILABLE[$name]="lockfile changed"
+        UPDATES_NEEDED+=("$name")
+        return 0
+    fi
+}
+
+check_deps_updates() {
+    log step "Checking dependencies for updates..."
+
+    cd "$PROJECT_ROOT"
+    git fetch "$GIT_REMOTE" "$GIT_BRANCH" --quiet 2>/dev/null || true
+
+    if [[ "$UPDATE_ROOT_DEPS" == "true" ]]; then
+        check_lockfile_changes "$PROJECT_ROOT" "root_deps" || true
+    fi
+
+    if [[ "$UPDATE_ENGINE_DEPS" == "true" ]]; then
+        check_lockfile_changes "${PROJECT_ROOT}/engine" "engine_deps" || true
+    fi
+
+    if [[ "$UPDATE_WEBCLIENT_DEPS" == "true" ]]; then
+        check_lockfile_changes "${PROJECT_ROOT}/webclient" "webclient_deps" || true
+    fi
+
+    if [[ "$UPDATE_GATEWAY_DEPS" == "true" ]]; then
+        check_lockfile_changes "${PROJECT_ROOT}/gateway" "gateway_deps" || true
+    fi
+}
+
+check_content_updates() {
+    log step "Checking content for updates..."
+
+    cd "$PROJECT_ROOT"
+
+    # Check if content directory has changed
+    if git diff --quiet "${GIT_REMOTE}/${GIT_BRANCH}" -- content/ 2>/dev/null; then
+        log current "Game content"
+        UPDATE_AVAILABLE[content]=""
+    else
+        log update "Game content: files changed"
+        UPDATE_AVAILABLE[content]="files changed"
+        UPDATES_NEEDED+=("content")
+    fi
+}
+
+check_all_updates() {
+    log header "Checking for Updates"
+
+    UPDATES_NEEDED=()
+
+    if [[ "$UPDATE_REPO" == "true" ]]; then
+        check_repo_updates || true
+    fi
+
+    check_deps_updates
+    check_content_updates
+
+    echo ""
+    if [[ ${#UPDATES_NEEDED[@]} -eq 0 ]]; then
+        log success "Everything is up to date!"
+        return 1
+    else
+        log info "Updates available: ${#UPDATES_NEEDED[@]}"
+        return 0
+    fi
+}
+
+# =============================================================================
+# UPDATE FUNCTIONS
+# =============================================================================
+
+update_repo() {
+    if [[ "$UPDATE_REPO" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Updating repository..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would pull from ${GIT_REMOTE}/${GIT_BRANCH}"
+        return 0
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    # Stash local changes if requested
+    if [[ "$GIT_STASH" == "true" ]]; then
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            log info "Stashing local changes..."
+            git stash push -m "rs-sdk-update-$(date +%Y%m%d%H%M%S)"
+        fi
+    fi
+
+    # Pull changes
+    git pull "$GIT_REMOTE" "$GIT_BRANCH"
+
+    log success "Repository updated"
+    UPDATES_APPLIED+=("repo")
+}
+
+update_deps() {
+    local dir="$1"
+    local name="$2"
+
+    log step "Updating ${name} dependencies..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: bun install in $dir"
+        return 0
+    fi
+
+    cd "$dir"
+    bun install
+
+    log success "${name} dependencies updated"
+    UPDATES_APPLIED+=("$name")
+}
+
+update_all_deps() {
+    if [[ "$UPDATE_ROOT_DEPS" == "true" ]]; then
+        update_deps "$PROJECT_ROOT" "Root"
+    fi
+
+    if [[ "$UPDATE_ENGINE_DEPS" == "true" ]]; then
+        update_deps "${PROJECT_ROOT}/engine" "Engine"
+    fi
+
+    if [[ "$UPDATE_WEBCLIENT_DEPS" == "true" ]]; then
+        update_deps "${PROJECT_ROOT}/webclient" "Webclient"
+    fi
+
+    if [[ "$UPDATE_GATEWAY_DEPS" == "true" ]]; then
+        update_deps "${PROJECT_ROOT}/gateway" "Gateway"
+    fi
+}
+
+run_migrations() {
+    if [[ "$RUN_MIGRATIONS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Running database migrations..."
+
+    setup_prisma_env
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run migrations"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+
+    if [[ "$DB_BACKEND" == "sqlite" ]]; then
+        bun run sqlite:migrate
+    else
+        bun run db:migrate
+    fi
+
+    log success "Migrations complete"
+    UPDATES_APPLIED+=("migrations")
+}
+
+rebuild_engine_content() {
+    if [[ "$REBUILD_ENGINE_CONTENT" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Rebuilding engine content..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would rebuild engine content"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/engine"
+    bun run build
+
+    log success "Engine content rebuilt"
+    UPDATES_APPLIED+=("engine_content")
+}
+
+rebuild_webclient() {
+    if [[ "$REBUILD_WEBCLIENT" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Rebuilding webclient..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would rebuild webclient"
+        return 0
+    fi
+
+    cd "${PROJECT_ROOT}/webclient"
+    bun run build
+
+    log success "Webclient rebuilt"
+    UPDATES_APPLIED+=("webclient")
+}
+
+copy_webclient_assets() {
+    if [[ "$COPY_WEBCLIENT_ASSETS" != "true" ]]; then
+        return 0
+    fi
+
+    log step "Copying webclient assets..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would copy webclient assets"
+        return 0
+    fi
+
+    mkdir -p "${PROJECT_ROOT}/engine/public/client"
+    mkdir -p "${PROJECT_ROOT}/engine/public/bot"
+
+    cp "${PROJECT_ROOT}/webclient/out/standard/client.js" "${PROJECT_ROOT}/engine/public/client/"
+    cp "${PROJECT_ROOT}/webclient/out/bot/client.js" "${PROJECT_ROOT}/engine/public/bot/"
+
+    log success "Webclient assets copied"
+    UPDATES_APPLIED+=("webclient_assets")
+}
+
+# =============================================================================
+# SUMMARY
+# =============================================================================
+
+show_update_summary() {
+    log header "Update Summary"
+
+    if [[ ${#UPDATES_NEEDED[@]} -gt 0 ]]; then
+        echo -e "${BOLD}Updates Available:${NC}"
+        for update in "${UPDATES_NEEDED[@]}"; do
+            local detail="${UPDATE_AVAILABLE[$update]:-}"
+            if [[ -n "$detail" ]]; then
+                echo -e "  ${CYAN}↑${NC} ${update}: ${detail}"
+            else
+                echo -e "  ${CYAN}↑${NC} ${update}"
+            fi
+        done
+        echo ""
+    fi
+
+    if [[ ${#UPDATES_APPLIED[@]} -gt 0 ]]; then
+        echo -e "${BOLD}Updates Applied:${NC}"
+        for update in "${UPDATES_APPLIED[@]}"; do
+            echo -e "  ${GREEN}✓${NC} ${update}"
+        done
+        echo ""
+    fi
+
+    if [[ ${#UPDATES_APPLIED[@]} -eq 0 ]] && [[ "$CHECK_ONLY" != "true" ]]; then
+        log info "No updates were applied"
+    fi
+}
+
+# =============================================================================
+# MAIN COMMANDS
+# =============================================================================
+
+do_check() {
+    check_all_updates
+    show_update_summary
+}
+
+do_apply() {
+    log header "Applying Updates"
+
+    if [[ "$FORCE_UPDATE" != "true" ]]; then
+        check_all_updates || {
+            log success "Nothing to update"
+            return 0
+        }
+    fi
+
+    if [[ "$CHECK_ONLY" == "true" ]]; then
+        show_update_summary
+        return 0
+    fi
+
+    # Confirm
+    if [[ "$SKIP_CONFIRM" != "true" ]] && [[ "$DRY_RUN" != "true" ]]; then
+        echo ""
+        read -p "Apply updates? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log info "Aborted"
+            return 0
+        fi
+    fi
+
+    update_repo
+    update_all_deps
+    run_migrations
+    rebuild_engine_content
+    rebuild_webclient
+    copy_webclient_assets
+
+    show_update_summary
+    log success "Update complete!"
+}
+
+do_repo() {
+    log header "Updating Repository Only"
+    UPDATE_ROOT_DEPS=false
+    UPDATE_ENGINE_DEPS=false
+    UPDATE_WEBCLIENT_DEPS=false
+    UPDATE_GATEWAY_DEPS=false
+    REBUILD_ENGINE_CONTENT=false
+    REBUILD_WEBCLIENT=false
+    COPY_WEBCLIENT_ASSETS=false
+    RUN_MIGRATIONS=false
+
+    check_repo_updates || [[ "$FORCE_UPDATE" == "true" ]] || {
+        log success "Repository is up to date"
+        return 0
+    }
+
+    update_repo
+    show_update_summary
+}
+
+do_deps() {
+    log header "Updating Dependencies Only"
+    UPDATE_REPO=false
+    REBUILD_ENGINE_CONTENT=false
+    REBUILD_WEBCLIENT=false
+    COPY_WEBCLIENT_ASSETS=false
+    RUN_MIGRATIONS=false
+
+    update_all_deps
+    show_update_summary
+}
+
+do_build() {
+    log header "Rebuilding Only"
+    UPDATE_REPO=false
+    UPDATE_ROOT_DEPS=false
+    UPDATE_ENGINE_DEPS=false
+    UPDATE_WEBCLIENT_DEPS=false
+    UPDATE_GATEWAY_DEPS=false
+    RUN_MIGRATIONS=false
+
+    rebuild_engine_content
+    rebuild_webclient
+    copy_webclient_assets
+    show_update_summary
+}
+
+do_all() {
+    log header "Full Update Cycle"
+    FORCE_UPDATE=true
+    do_apply
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    load_config
+    parse_args "$@"
+    setup_colors
+
+    if [[ "$DUMP_CONFIG" == "true" ]]; then
+        dump_config
+        exit 0
+    fi
+
+    # Validate project root
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        log error "Project root not found or not a git repository: $PROJECT_ROOT"
+        exit 1
+    fi
+
+    case "$COMMAND" in
+        check)
+            CHECK_ONLY=true
+            do_check
+            ;;
+        apply)
+            do_apply
+            ;;
+        repo)
+            do_repo
+            ;;
+        deps)
+            do_deps
+            ;;
+        build)
+            do_build
+            ;;
+        all)
+            do_all
+            ;;
+        *)
+            log error "Unknown command: $COMMAND"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

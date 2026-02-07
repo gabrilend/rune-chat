@@ -1,0 +1,233 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Tool metadata
+local tool_info = {
+    name = "text_update",
+    description = "Find and replace text in a file. " ..
+                  "Use this for updating variable names, URLs, configuration values, or any text substitution. " ..
+                  "Uses literal string matching (not regex). " ..
+                  "Can replace first occurrence or all occurrences.",
+    parameters = {
+        type = "object",
+        properties = {
+            filename = {
+                type = "string",
+                description = "The file to modify (e.g., 'config.json', 'src/utils.lua', 'docs/readme.md')"
+            },
+            find = {
+                type = "string",
+                description = "The exact text to find (literal match, not regex)"
+            },
+            replace = {
+                type = "string",
+                description = "The replacement text"
+            },
+            all = {
+                type = "boolean",
+                description = "If true, replace all occurrences. If false or omitted, replace only first occurrence."
+            }
+        },
+        required = {"filename", "find", "replace"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local filename = params.filename
+local find_str = params.find
+local replace_str = params.replace
+local replace_all = params.all or false
+local project_dir = params._project_dir or "."
+
+if not filename or not find_str or not replace_str then
+    print(json.encode({success = false, error = "Missing required parameters: filename, find, and replace"}))
+    os.exit(1)
+end
+
+-- Security: sanitize filename to prevent path traversal and shell injection
+local function sanitize_path(path)
+    local violations = {}
+    local original = path
+
+    -- Remove null bytes
+    if path:match("%z") then
+        table.insert(violations, "null bytes")
+        path = path:gsub("%z", "")
+    end
+
+    -- Remove or neutralize dangerous patterns
+    if path:match("%.%.") then
+        table.insert(violations, "'../' parent directory traversal")
+        path = path:gsub("%.%.", "")
+    end
+    if path:match("^~/") or path:match("^~$") then
+        table.insert(violations, "'~/' home directory expansion")
+        path = path:gsub("^~/", "")
+        path = path:gsub("^~", "")
+    end
+    if path:match("^/") then
+        table.insert(violations, "absolute path starting with '/'")
+        path = path:gsub("^/", "")
+    end
+    if path:match("%$[%w_]") or path:match("%$%b{}") then
+        table.insert(violations, "'$VAR' or '${VAR}' environment variable expansion")
+        path = path:gsub("%$[%w_]*", "")
+        path = path:gsub("%$%b{}", "")
+    end
+    if path:match("`.-`") or path:match("%$%(.-%)") then
+        table.insert(violations, "'`cmd`' or '$(cmd)' command substitution")
+        path = path:gsub("`.-`", "")
+        path = path:gsub("%$%(.-%)","")
+    end
+
+    -- Normalize (not a violation, just cleanup)
+    path = path:gsub("\\", "/")            -- normalize backslashes
+    path = path:gsub("/+", "/")            -- collapse multiple slashes
+    path = path:gsub("^/", "")             -- remove leading slash (again, after collapse)
+    path = path:gsub("/$", "")             -- remove trailing slash
+
+    return path, violations, original
+end
+
+local sanitized_filename, violations, original_filename = sanitize_path(filename)
+filename = sanitized_filename
+
+-- Report violations to help LLM learn
+if #violations > 0 then
+    print(json.encode({
+        success = false,
+        error = "Filename contained unsafe patterns that were rejected",
+        violations = violations,
+        original_filename = original_filename,
+        suggestion = "Use simple relative paths like 'config.json' or 'src/utils.lua'. Do not use: parent traversal (..), home directory (~), absolute paths (/), environment variables ($VAR), or command substitution (`cmd` or $(cmd))."
+    }))
+    os.exit(1)
+end
+
+-- Reject if filename is empty after sanitization
+if filename == "" then
+    print(json.encode({success = false, error = "Invalid filename: empty after sanitization"}))
+    os.exit(1)
+end
+
+-- Build full path relative to project directory
+local full_path = project_dir .. "/" .. filename
+
+-- Check if file exists
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    return false
+end
+
+if not file_exists(full_path) then
+    print(json.encode({
+        success = false,
+        error = "File not found",
+        filename = filename,
+        suggestion = "Check the filename or use write_text/write_code to create the file first"
+    }))
+    os.exit(1)
+end
+
+-- Read file content
+local file, read_err = io.open(full_path, "r")
+if not file then
+    print(json.encode({success = false, error = "Failed to open file: " .. tostring(read_err)}))
+    os.exit(1)
+end
+
+local content = file:read("*a")
+file:close()
+
+-- Escape special pattern characters for literal matching
+local function escape_pattern(s)
+    return s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+end
+
+local escaped_find = escape_pattern(find_str)
+
+-- Check if string exists in file
+if not content:find(escaped_find) then
+    print(json.encode({
+        success = false,
+        error = "Search string not found in file",
+        filename = filename,
+        search_string = find_str,
+        suggestion = "Check that the search string exists in the file. Use read_file to verify contents."
+    }))
+    os.exit(1)
+end
+
+-- Count occurrences before replacement
+local _, count_before = content:gsub(escaped_find, "")
+
+-- Perform replacement
+local new_content
+local replacements_made
+
+if replace_all then
+    new_content, replacements_made = content:gsub(escaped_find, replace_str:gsub("%%", "%%%%"))
+else
+    new_content = content:gsub(escaped_find, replace_str:gsub("%%", "%%%%"), 1)
+    replacements_made = 1
+end
+
+-- Write updated content
+file, write_err = io.open(full_path, "w")
+if not file then
+    print(json.encode({success = false, error = "Failed to write file: " .. tostring(write_err)}))
+    os.exit(1)
+end
+
+file:write(new_content)
+file:close()
+
+-- Get file info
+local line_count = select(2, new_content:gsub("\n", "\n")) + 1
+local byte_count = #new_content
+
+-- Success message
+local remaining = count_before - replacements_made
+local message
+if replace_all then
+    message = string.format("Replaced all %d occurrences of '%s' with '%s' in %s",
+        replacements_made, find_str, replace_str, filename)
+else
+    if remaining > 0 then
+        message = string.format("Replaced first occurrence of '%s' with '%s' in %s (%d more occurrences remain)",
+            find_str, replace_str, filename, remaining)
+    else
+        message = string.format("Replaced '%s' with '%s' in %s (was the only occurrence)",
+            find_str, replace_str, filename)
+    end
+end
+
+print(json.encode({
+    success = true,
+    message = message,
+    replacements = replacements_made,
+    total_occurrences = count_before,
+    remaining = remaining,
+    lines = line_count,
+    bytes = byte_count
+}))

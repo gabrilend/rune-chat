@@ -1,0 +1,205 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Tool metadata
+local tool_info = {
+    name = "read_file",
+    description = "Read the contents of a file or list directory contents. " ..
+                  "Use this to examine existing code, configuration files, or see what files exist. " ..
+                  "Returns file content with line numbers, or directory listing if path is a directory.",
+    parameters = {
+        type = "object",
+        properties = {
+            path = {
+                type = "string",
+                description = "The file or directory path to read"
+            },
+            start_line = {
+                type = "number",
+                description = "Optional: first line to read (1-indexed). If omitted, starts from beginning."
+            },
+            end_line = {
+                type = "number",
+                description = "Optional: last line to read (inclusive). If omitted, reads to end."
+            }
+        },
+        required = {"path"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local path = params.path
+local start_line = params.start_line
+local end_line = params.end_line
+local project_dir = params._project_dir or "."
+
+if not path then
+    print(json.encode({success = false, error = "Missing required parameter: path"}))
+    os.exit(1)
+end
+
+-- Security: prevent path traversal outside current directory tree
+if path:match("^/") and not path:match("^/home/") then
+    print(json.encode({success = false, error = "Absolute paths outside /home/ not allowed"}))
+    os.exit(1)
+end
+
+-- Make relative paths relative to project directory
+if not path:match("^/") then
+    path = project_dir .. "/" .. path
+end
+
+-- Check if path exists and what type it is
+local function file_exists(p)
+    local f = io.open(p, "r")
+    if f then f:close() return true end
+    return false
+end
+
+local function is_directory(p)
+    local handle = io.popen('test -d "' .. p:gsub('"', '\\"') .. '" && echo yes')
+    local result = handle:read("*a")
+    handle:close()
+    return result:match("yes")
+end
+
+local function is_binary(p)
+    -- Check using file command with encoding detection
+    local handle = io.popen('file -b "' .. p:gsub('"', '\\"') .. '" 2>/dev/null')
+    local file_type = handle:read("*a"):gsub("%s+$", ""):lower()
+    handle:close()
+
+    -- If file says it's text, script, or source code, it's not binary
+    if file_type:match("text") or file_type:match("script") or file_type:match("source")
+       or file_type:match("ascii") or file_type:match("utf%-8") or file_type:match("unicode") then
+        return false
+    end
+
+    -- Also check common source file extensions
+    local ext = p:match("%.([^%.]+)$")
+    if ext then
+        ext = ext:lower()
+        local text_exts = {
+            lua=1, py=1, js=1, ts=1, c=1, h=1, cpp=1, hpp=1, rs=1, go=1,
+            rb=1, java=1, sh=1, bash=1, zsh=1, fish=1, json=1, yaml=1, yml=1,
+            toml=1, xml=1, html=1, css=1, md=1, txt=1, ini=1, conf=1, cfg=1
+        }
+        if text_exts[ext] then return false end
+    end
+
+    return true
+end
+
+-- Handle directory listing
+if is_directory(path) then
+    -- Use tree with 5 level depth, fall back to find if tree not available
+    local handle = io.popen('tree -L 5 --noreport "' .. path:gsub('"', '\\"') .. '" 2>/dev/null || find "' .. path:gsub('"', '\\"') .. '" -maxdepth 5 -print 2>&1')
+    local listing = handle:read("*a")
+    handle:close()
+
+    -- Count items
+    local count_handle = io.popen('find "' .. path:gsub('"', '\\"') .. '" -maxdepth 5 | wc -l')
+    local item_count = tonumber(count_handle:read("*a")) or 0
+    count_handle:close()
+
+    print(json.encode({
+        success = true,
+        type = "directory",
+        path = path,
+        listing = listing,
+        item_count = item_count
+    }))
+    os.exit(0)
+end
+
+-- Check if file exists
+if not file_exists(path) then
+    print(json.encode({success = false, error = "File not found: " .. path}))
+    os.exit(1)
+end
+
+-- Check for binary
+if is_binary(path) then
+    -- Get file size
+    local handle = io.popen('stat -c%s "' .. path:gsub('"', '\\"') .. '" 2>/dev/null || stat -f%z "' .. path:gsub('"', '\\"') .. '" 2>/dev/null')
+    local size = tonumber(handle:read("*a")) or 0
+    handle:close()
+
+    print(json.encode({
+        success = true,
+        type = "binary",
+        path = path,
+        size = size,
+        warning = "File appears to be binary, content not shown"
+    }))
+    os.exit(0)
+end
+
+-- Read the file
+local file, err = io.open(path, "r")
+if not file then
+    print(json.encode({success = false, error = "Failed to open file: " .. tostring(err)}))
+    os.exit(1)
+end
+
+-- Read all lines
+local lines = {}
+local line_num = 0
+for line in file:lines() do
+    line_num = line_num + 1
+    lines[line_num] = line
+end
+file:close()
+
+local total_lines = line_num
+
+-- Apply line range
+start_line = start_line or 1
+end_line = end_line or total_lines
+
+-- Clamp to valid range
+start_line = math.max(1, math.min(start_line, total_lines))
+end_line = math.max(start_line, math.min(end_line, total_lines))
+
+-- Build content with line numbers
+local content_lines = {}
+for i = start_line, end_line do
+    table.insert(content_lines, string.format("%4d | %s", i, lines[i] or ""))
+end
+
+local content = table.concat(content_lines, "\n")
+
+-- Get file size
+local size = 0
+for _, line in ipairs(lines) do
+    size = size + #line + 1  -- +1 for newline
+end
+
+print(json.encode({
+    success = true,
+    type = "file",
+    path = path,
+    content = content,
+    total_lines = total_lines,
+    showing_lines = {start_line, end_line},
+    size = size
+}))

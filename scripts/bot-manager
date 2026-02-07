@@ -1,0 +1,1322 @@
+#!/bin/bash
+# bot-manager - Launcher for the TypeScript bot manager
+#
+# Usage:
+#   ./bot-manager         # Runs TypeScript version (default)
+#   ./bot-manager --legacy  # Runs old file-based version
+#
+# First time setup:
+#   cd rs-sdk/engine && bun run db:push
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE_DIR="${SCRIPT_DIR}/../rs-sdk/engine"
+
+# Default: launch TypeScript version
+if [[ "$1" != "--legacy" ]]; then
+    cd "$ENGINE_DIR" && exec bun run tools/bot-manager.ts
+fi
+
+# Legacy mode below (--legacy flag)
+echo "Starting legacy file-based mode..."
+echo ""
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RS_SDK_DIR="${SCRIPT_DIR}/../rs-sdk"
+ACCOUNTS_DIR="${RS_SDK_DIR}/accounts"
+BEHAVIORS_DIR="${RS_SDK_DIR}/behaviors"
+BOTS_DIR="${RS_SDK_DIR}/bots"  # Legacy support
+GATEWAY_HOST="${GATEWAY_HOST:-localhost}"
+GATEWAY_PORT="${GATEWAY_PORT:-8245}"
+
+# Ollama configuration for text generation
+OLLAMA_HOST="${OLLAMA_HOST:-192.168.0.61}"
+OLLAMA_PORT="${OLLAMA_PORT:-16180}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2}"
+
+# State
+SELECTED=0
+ACCOUNTS=()
+ACCOUNT_NAMES=()
+RUNNING=true
+MESSAGE=""
+MESSAGE_TIME=0
+VIEW_MODE="accounts"  # accounts | behaviors
+
+# Behaviors list
+BEHAVIORS=("idle" "wander" "follower" "social" "chatty" "companion" "dynamic")
+
+# Colors (using $'...' for actual escape sequences)
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+CYAN=$'\033[36m'
+WHITE=$'\033[37m'
+
+# Check if we have a real terminal
+if [[ ! -t 0 ]]; then
+    echo "Error: bot-manager requires an interactive terminal"
+    exit 1
+fi
+
+# Save/restore terminal state
+save_terminal() {
+    printf "\033[?1049h"  # Use alternate screen buffer
+    printf "\033[?25l"    # Hide cursor
+    stty -echo -icanon 2>/dev/null || true
+}
+
+restore_terminal() {
+    printf "\033[?25h"    # Show cursor
+    printf "\033[?1049l"  # Restore main screen buffer
+    stty echo icanon 2>/dev/null || true
+}
+
+cleanup() {
+    restore_terminal
+    exit 0
+}
+
+trap cleanup EXIT INT TERM
+
+# =============================================================================
+# OLLAMA TEXT GENERATION
+# =============================================================================
+# Press ~ during text input to generate content with Ollama.
+# The generated text replaces the current input.
+
+# Escape a string for JSON (no jq dependency)
+json_escape() {
+    local str="$1"
+    # Escape backslashes, quotes, and control characters
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    str="${str//$'\n'/\\n}"
+    str="${str//$'\r'/\\r}"
+    str="${str//$'\t'/\\t}"
+    printf '%s' "$str"
+}
+
+# Extract a JSON string value by key (simple, no jq needed)
+# Usage: json_extract "key" <<< "$json"
+json_extract() {
+    local key="$1"
+    # Match "key": "value" or "key":"value"
+    sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+# Generate text using Ollama (no tool calling, simpler approach)
+# Usage: ollama_generate "context" "prompt"
+# Returns the generated text via stdout
+ollama_generate() {
+    local context="$1"
+    local prompt="$2"
+    local escaped_context escaped_prompt
+
+    escaped_context=$(json_escape "$context")
+    escaped_prompt=$(json_escape "$prompt")
+
+    local full_prompt="You are helping create a RuneScape bot character. The user is filling out a character sheet.
+
+Context: ${context}
+
+User request: ${prompt}
+
+Respond with ONLY the requested content. No explanation, no JSON, no markdown formatting. Just the raw text that should fill the field."
+
+    local escaped_full_prompt
+    escaped_full_prompt=$(json_escape "$full_prompt")
+
+    # Build the request JSON (simple, no tools)
+    local request_json="{\"model\": \"${OLLAMA_MODEL}\", \"messages\": [{\"role\": \"user\", \"content\": \"${escaped_full_prompt}\"}], \"stream\": false}"
+
+    # Call Ollama API
+    local response
+    response=$(curl -sf --max-time 60 -X POST \
+        "http://${OLLAMA_HOST}:${OLLAMA_PORT}/api/chat" \
+        -H "Content-Type: application/json" \
+        -d "$request_json" 2>/dev/null)
+
+    if [[ $? -ne 0 || -z "$response" ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Extract content from response using simple pattern matching
+    # Response format: {"message":{"role":"assistant","content":"..."}, ...}
+    local content
+    content=$(echo "$response" | json_extract "content")
+
+    # Clean up the content (remove any remaining JSON artifacts)
+    content=$(echo "$content" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+    # Unescape JSON escapes
+    content="${content//\\n/$'\n'}"
+    content="${content//\\r/}"
+    content="${content//\\t/$'\t'}"
+    content="${content//\\\"/\"}"
+    content="${content//\\\\/\\}"
+
+    echo "$content"
+}
+
+# Read input with Ollama generation support
+# Usage: read_with_ollama "prompt" "context" variable_name [default_value]
+# Press ~ at start of line to trigger Ollama generation
+read_with_ollama() {
+    local prompt="$1"
+    local context="$2"
+    local varname="$3"
+    local default="$4"
+    local input=""
+    local show_hint=true
+
+    while true; do
+        if $show_hint; then
+            printf "%s" "${DIM}(Press ~ for AI generation)${RESET} "
+            show_hint=false
+        fi
+        printf "%s" "$prompt"
+        read -r input
+
+        if [[ "$input" == "~" || "$input" == "~"* ]]; then
+            # Trigger Ollama generation
+            local ai_prompt="${input#\~}"
+            ai_prompt="${ai_prompt#"${ai_prompt%%[![:space:]]*}"}"  # Trim leading whitespace
+
+            if [[ -z "$ai_prompt" ]]; then
+                printf "Enter prompt for AI generation: "
+                read -r ai_prompt
+            fi
+
+            if [[ -n "$ai_prompt" ]]; then
+                printf "${CYAN}Generating...${RESET}\n"
+                local generated
+                generated=$(ollama_generate "$context" "$ai_prompt")
+
+                if [[ -n "$generated" ]]; then
+                    printf "${GREEN}Generated: ${RESET}%s\n" "$generated"
+                    printf "Use this? (y/n/edit): "
+                    read -r confirm
+
+                    case "$confirm" in
+                        y|Y|yes)
+                            eval "$varname=\"\$generated\""
+                            return 0
+                            ;;
+                        e|edit)
+                            printf "Edit (current: %s): " "$generated"
+                            read -r edited
+                            if [[ -n "$edited" ]]; then
+                                eval "$varname=\"\$edited\""
+                            else
+                                eval "$varname=\"\$generated\""
+                            fi
+                            return 0
+                            ;;
+                        *)
+                            printf "Try again...\n"
+                            show_hint=true
+                            continue
+                            ;;
+                    esac
+                else
+                    printf "${RED}Failed to generate. Try again or enter manually.${RESET}\n"
+                    show_hint=true
+                    continue
+                fi
+            fi
+        else
+            # Normal input
+            if [[ -z "$input" && -n "$default" ]]; then
+                eval "$varname=\"\$default\""
+            else
+                eval "$varname=\"\$input\""
+            fi
+            return 0
+        fi
+    done
+}
+
+# Discover accounts by scanning for account.env files
+discover_accounts() {
+    ACCOUNTS=()
+    ACCOUNT_NAMES=()
+
+    # First check new accounts directory
+    if [[ -d "$ACCOUNTS_DIR" ]]; then
+        while IFS= read -r env_file; do
+            [[ "$env_file" == *"/_template/"* ]] && continue
+            local acct_dir
+            acct_dir=$(dirname "$env_file")
+            local acct_name
+            acct_name=$(basename "$acct_dir")
+            ACCOUNTS+=("$acct_dir")
+            ACCOUNT_NAMES+=("$acct_name")
+        done < <(find "$ACCOUNTS_DIR" -name "account.env" -type f 2>/dev/null | sort)
+    fi
+
+    # Also check legacy bots directory
+    if [[ -d "$BOTS_DIR" ]]; then
+        while IFS= read -r env_file; do
+            [[ "$env_file" == *"/_template/"* ]] && continue
+            local bot_dir
+            bot_dir=$(dirname "$env_file")
+            local bot_name
+            bot_name=$(basename "$bot_dir")
+            # Check if already added (avoid duplicates)
+            local found=0
+            for name in "${ACCOUNT_NAMES[@]}"; do
+                [[ "$name" == "$bot_name" ]] && found=1 && break
+            done
+            if [[ $found -eq 0 ]]; then
+                ACCOUNTS+=("$bot_dir")
+                ACCOUNT_NAMES+=("${bot_name} (legacy)")
+            fi
+        done < <(find "$BOTS_DIR" -name "bot.env" -type f 2>/dev/null | sort)
+    fi
+}
+
+# Get account status from gateway
+get_account_status() {
+    local username="$1"
+    local response
+    response=$(curl -sf --max-time 1 "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${username}" 2>/dev/null) || {
+        echo "OFFLINE"
+        return
+    }
+
+    local status
+    status=$(echo "$response" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+    case "$status" in
+        "active") echo "ONLINE" ;;
+        "stale")  echo "STALE" ;;
+        *)        echo "OFFLINE" ;;
+    esac
+}
+
+# Get account position from gateway
+get_account_position() {
+    local username="$1"
+    local response
+    response=$(curl -sf --max-time 1 "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${username}" 2>/dev/null) || {
+        echo ""
+        return
+    }
+
+    if [[ ! "$response" =~ \"inGame\"[[:space:]]*:[[:space:]]*true ]]; then
+        echo ""
+        return
+    fi
+
+    local worldX worldZ
+    worldX=$(echo "$response" | sed -n 's/.*"worldX"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+    worldZ=$(echo "$response" | sed -n 's/.*"worldZ"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+
+    if [[ -n "$worldX" && -n "$worldZ" ]]; then
+        echo "($worldX, $worldZ)"
+    else
+        echo ""
+    fi
+}
+
+# Get username from account/bot env file
+get_account_username() {
+    local acct_dir="$1"
+
+    # Try account.env first, then bot.env (legacy)
+    local env_file="${acct_dir}/account.env"
+    [[ ! -f "$env_file" ]] && env_file="${acct_dir}/bot.env"
+
+    if [[ -f "$env_file" ]]; then
+        grep -E "^BOT_USERNAME=" "$env_file" | cut -d= -f2- | tr -d '"'"'"'\r'
+    else
+        echo ""
+    fi
+}
+
+# Get bot name from env file (for display)
+get_bot_display_name() {
+    local acct_dir="$1"
+
+    local env_file="${acct_dir}/account.env"
+    [[ ! -f "$env_file" ]] && env_file="${acct_dir}/bot.env"
+
+    if [[ -f "$env_file" ]]; then
+        local name
+        name=$(grep -E "^BOT_NAME=" "$env_file" | cut -d= -f2- | tr -d '"'"'"'\r')
+        [[ -n "$name" ]] && echo "$name" && return
+    fi
+    echo ""
+}
+
+# Get terminal size
+get_term_size() {
+    TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+    TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+}
+
+# Move cursor to specific row
+move_to_row() {
+    printf "\033[%d;1H" "$1"
+}
+
+# Clear screen
+clear_screen() {
+    printf "\033[2J\033[H"
+}
+
+# Draw horizontal line
+draw_line() {
+    local width="$1"
+    local char="${2:-─}"
+    for ((i=0; i<width; i++)); do
+        printf "%s" "$char"
+    done
+}
+
+# Draw account line at specific row
+draw_account_line() {
+    local idx=$1
+    local screen_row=$2
+
+    local name="${ACCOUNT_NAMES[$idx]}"
+    local acct_dir="${ACCOUNTS[$idx]}"
+    local username
+    username=$(get_account_username "$acct_dir")
+    local display_name
+    display_name=$(get_bot_display_name "$acct_dir")
+
+    local status position=""
+    if [[ -n "$username" ]]; then
+        status=$(get_account_status "$username")
+        if [[ "$status" == "ONLINE" || "$status" == "STALE" ]]; then
+            position=$(get_account_position "$username")
+        fi
+    else
+        status="NO_USER"
+        username="(no username)"
+    fi
+
+    local status_text
+    case "$status" in
+        "ONLINE")  status_text="${GREEN}[ONLINE] ${RESET}" ;;
+        "STALE")   status_text="${YELLOW}[STALE]  ${RESET}" ;;
+        "OFFLINE") status_text="${DIM}[OFFLINE]${RESET}" ;;
+        *)         status_text="${RED}[NO USER]${RESET}" ;;
+    esac
+
+    local selector=" "
+    [[ $idx -eq $SELECTED ]] && selector="${BOLD}>${RESET}"
+
+    # Build display name
+    local label="$name"
+    [[ -n "$display_name" && "$display_name" != "$name" ]] && label="$name ($display_name)"
+
+    local line
+    printf -v line "│ %s %-20.20s %s %-15.15s %-12s" "$selector" "$label" "$status_text" "$username" "$position"
+
+    local line_len=${#line}
+    # Account for color codes (they don't take visual space)
+    local color_len=$(( ${#GREEN} + ${#RESET} + ${#BOLD} + ${#RESET} + ${#DIM} + ${#YELLOW} + ${#RED} ))
+    local pad=$((TERM_COLS - line_len + color_len - 1))
+    [[ $pad -lt 0 ]] && pad=0
+
+    move_to_row "$screen_row"
+    printf "%s%*s│" "$line" "$pad" ""
+}
+
+# Update selection (partial redraw)
+update_selection() {
+    local old_idx=$1
+    local new_idx=$2
+    local list_height=$((TERM_ROWS - 9))
+
+    local start_idx=0
+    if [[ $list_height -lt ${#ACCOUNT_NAMES[@]} ]]; then
+        if [[ $new_idx -gt $((list_height / 2)) ]]; then
+            start_idx=$((new_idx - list_height / 2))
+            if [[ $((start_idx + list_height)) -gt ${#ACCOUNT_NAMES[@]} ]]; then
+                start_idx=$((${#ACCOUNT_NAMES[@]} - list_height))
+            fi
+        fi
+    fi
+
+    local old_start=0
+    if [[ $list_height -lt ${#ACCOUNT_NAMES[@]} ]]; then
+        if [[ $old_idx -gt $((list_height / 2)) ]]; then
+            old_start=$((old_idx - list_height / 2))
+            if [[ $((old_start + list_height)) -gt ${#ACCOUNT_NAMES[@]} ]]; then
+                old_start=$((${#ACCOUNT_NAMES[@]} - list_height))
+            fi
+        fi
+    fi
+
+    if [[ $start_idx -ne $old_start ]]; then
+        draw_ui
+        return
+    fi
+
+    local old_screen_row=$((4 + old_idx - start_idx))
+    local new_screen_row=$((4 + new_idx - start_idx))
+
+    if [[ $old_idx -ge $start_idx && $old_idx -lt $((start_idx + list_height)) ]]; then
+        draw_account_line "$old_idx" "$old_screen_row"
+    fi
+
+    if [[ $new_idx -ge $start_idx && $new_idx -lt $((start_idx + list_height)) ]]; then
+        draw_account_line "$new_idx" "$new_screen_row"
+    fi
+}
+
+# Draw the main TUI
+draw_ui() {
+    get_term_size
+    clear_screen
+
+    local list_height=$((TERM_ROWS - 9))
+
+    # Top border
+    printf "┌"
+    draw_line $((TERM_COLS - 2))
+    printf "┐\n"
+
+    # Header
+    local header="│ ${BOLD}RS-SDK Bot Manager${RESET} - Accounts"
+    local header_pad=$((TERM_COLS - 27 - 1))  # Adjust for color codes
+    printf "%s%*s│\n" "$header" "$header_pad" ""
+
+    # Separator
+    printf "├"
+    draw_line $((TERM_COLS - 2))
+    printf "┤\n"
+
+    # Account list
+    local start_idx=0
+    local end_idx=$((${#ACCOUNT_NAMES[@]} - 1))
+
+    if [[ $list_height -lt ${#ACCOUNT_NAMES[@]} ]]; then
+        if [[ $SELECTED -gt $((list_height / 2)) ]]; then
+            start_idx=$((SELECTED - list_height / 2))
+            if [[ $((start_idx + list_height)) -gt ${#ACCOUNT_NAMES[@]} ]]; then
+                start_idx=$((${#ACCOUNT_NAMES[@]} - list_height))
+            fi
+        fi
+        end_idx=$((start_idx + list_height - 1))
+        [[ $end_idx -ge ${#ACCOUNT_NAMES[@]} ]] && end_idx=$((${#ACCOUNT_NAMES[@]} - 1))
+    fi
+
+    local row=0
+    for ((i=start_idx; i<=end_idx; i++)); do
+        draw_account_line "$i" $((4 + row))
+        printf "\n"
+        row=$((row + 1))
+    done
+
+    # Pad remaining rows
+    while [[ $row -lt $list_height ]]; do
+        printf "│%*s│\n" "$((TERM_COLS - 2))" ""
+        row=$((row + 1))
+    done
+
+    # Separator
+    printf "├"
+    draw_line $((TERM_COLS - 2))
+    printf "┤\n"
+
+    # Help line
+    local help_text
+    if [[ -n "$MESSAGE" ]]; then
+        local now
+        now=$(date +%s)
+        if [[ $((now - MESSAGE_TIME)) -lt 3 ]]; then
+            help_text="$MESSAGE"
+        else
+            MESSAGE=""
+            help_text="[↑/↓] Navigate  [Enter] Launch  [s] Status  [m] Memory  [b] Behaviors  [r] Refresh  [n] New  [q] Quit"
+        fi
+    else
+        help_text="[↑/↓] Navigate  [Enter] Launch  [s] Status  [m] Memory  [b] Behaviors  [r] Refresh  [n] New  [q] Quit"
+    fi
+    local help_line="│ ${help_text}"
+    local help_pad=$((TERM_COLS - ${#help_line} - 1))
+    [[ $help_pad -lt 0 ]] && help_pad=0
+    printf "%s%*s│\n" "$help_line" "$help_pad" ""
+
+    # Footer
+    local footer_line="│ ${#ACCOUNT_NAMES[@]} accounts"
+    local footer_pad=$((TERM_COLS - ${#footer_line} - 1))
+    [[ $footer_pad -lt 0 ]] && footer_pad=0
+    printf "%s%*s│\n" "$footer_line" "$footer_pad" ""
+
+    # Bottom border
+    printf "└"
+    draw_line $((TERM_COLS - 2))
+    printf "┘\n"
+}
+
+show_message() {
+    MESSAGE="$1"
+    MESSAGE_TIME=$(date +%s)
+}
+
+# Select behavior and launch
+launch_account() {
+    local acct_dir="${ACCOUNTS[$SELECTED]}"
+    local name="${ACCOUNT_NAMES[$SELECTED]}"
+    local username
+    username=$(get_account_username "$acct_dir")
+
+    if [[ -z "$username" ]]; then
+        show_message "No username configured for ${name}"
+        return
+    fi
+
+    # Restore terminal for behavior selection
+    restore_terminal
+    clear
+
+    echo ""
+    echo "${BOLD}Launch ${name} (${username})${RESET}"
+    echo ""
+    echo "Select a behavior:"
+    echo ""
+
+    local i=1
+    echo "  ${BOLD}New Architecture (task-based):${RESET}"
+    echo "  1) task-runner   - New task-based bot runner with LLM"
+    echo ""
+    echo "  ${BOLD}Legacy Scripts:${RESET}"
+
+    # Check for legacy script.ts
+    if [[ -f "${acct_dir}/script.ts" ]]; then
+        echo "  2) default       - Run script.ts in bot directory"
+    fi
+
+    # Check for known legacy scripts
+    for bdir in "$BOTS_DIR"/*/; do
+        [[ "$bdir" == *"/_template/"* ]] && continue
+        local bname
+        bname=$(basename "$bdir")
+        if [[ -f "${bdir}script.ts" ]]; then
+            echo "  -) ${bname}       - Legacy bot script"
+        fi
+    done
+
+    echo ""
+    echo "  0) Cancel"
+    echo ""
+    printf "Choice: "
+    read -r choice
+
+    case "$choice" in
+        1)
+            # Run with new task-based runner
+            launch_task_runner "$acct_dir"
+            ;;
+        2)
+            # Run legacy script
+            if [[ -f "${acct_dir}/script.ts" ]]; then
+                launch_legacy_script "$acct_dir"
+            else
+                echo "No script.ts found"
+                read -n1 -r
+            fi
+            ;;
+        0|"")
+            ;;
+        *)
+            echo "Invalid choice"
+            read -n1 -r
+            ;;
+    esac
+
+    save_terminal
+    draw_ui
+}
+
+# Launch new task-based runner
+launch_task_runner() {
+    local acct_dir="$1"
+    local acct_name
+    acct_name=$(basename "$acct_dir")
+
+    echo ""
+    echo "Starting task-based bot runner..."
+    echo "Account directory: ${acct_dir}"
+    echo ""
+
+    # Create a temporary runner script
+    local runner_script
+    runner_script=$(mktemp /tmp/bot-runner-XXXXXX.ts)
+
+    # Write the runner script with the account directory embedded
+    cat > "$runner_script" << RUNNER_EOF
+// Task-based bot runner with full memory systems
+import { createBotRunner, type BotRunnerConfig } from './rs-sdk/bot-core';
+import { allBehaviors } from './rs-sdk/behaviors';
+
+const username = process.env.BOT_USERNAME!;
+const password = process.env.PASSWORD!;
+const gatewayUrl = process.env.GATEWAY_URL || 'ws://localhost:8245';
+const botName = process.env.BOT_NAME || username;
+const personality = process.env.PERSONALITY || 'A helpful adventurer.';
+
+// Account directory for persistent memory (item memory, location memory)
+const accountDir = '${acct_dir}';
+
+const config: BotRunnerConfig = {
+    username,
+    password,
+    gatewayUrl,
+    accountDir,
+    botName,
+    personality,
+    toolsDir: './rs-sdk/tools',
+    respondToNearbyChat: true,  // Enable social interactions
+    log: (...args: any[]) => console.log(\`[\${new Date().toLocaleTimeString()}]\`, ...args),
+};
+
+console.log('Creating bot runner...');
+console.log(\`  Username: \${username}\`);
+console.log(\`  Bot Name: \${botName}\`);
+console.log(\`  Account Dir: \${accountDir}\`);
+console.log(\`  Gateway: \${gatewayUrl}\`);
+console.log('');
+
+const runner = await createBotRunner(config);
+
+// Register all behaviors
+for (const behavior of allBehaviors) {
+    runner.registerBehavior(behavior);
+    console.log(\`  Registered behavior: \${behavior.name}\`);
+}
+
+// Access memory systems for status
+const itemMemory = runner.getItemMemory();
+const locationMemory = runner.getLocationMemory();
+
+console.log('');
+console.log('Memory systems loaded:');
+console.log(\`  \${locationMemory.formatForLLM()}\`);
+console.log(\`  \${itemMemory.getSummaryForLLM()}\`);
+console.log('');
+
+console.log(\`Starting \${botName} (\${username})...\`);
+console.log('Press Ctrl+C to stop');
+console.log('');
+
+await runner.start();
+
+// Handle Ctrl+C gracefully
+process.on('SIGINT', async () => {
+    console.log('');
+    console.log('Shutting down gracefully...');
+    await runner.stop();
+    console.log('Goodbye!');
+    process.exit(0);
+});
+RUNNER_EOF
+
+    # Determine env file
+    local env_file="${acct_dir}/account.env"
+    [[ ! -f "$env_file" ]] && env_file="${acct_dir}/bot.env"
+
+    # Run it from the project root
+    cd "$RS_SDK_DIR/.."
+    bun --env-file="$env_file" "$runner_script"
+    local exit_code=$?
+
+    rm -f "$runner_script"
+
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then
+        echo "Bot exited normally."
+    else
+        echo "Bot exited with code: $exit_code"
+    fi
+    echo "Press any key to continue..."
+    read -n1 -r
+}
+
+# Launch legacy script
+launch_legacy_script() {
+    local acct_dir="$1"
+    local script="${acct_dir}/script.ts"
+
+    if [[ ! -f "$script" ]]; then
+        echo "No script.ts found"
+        return
+    fi
+
+    # Determine env file
+    local env_file="${acct_dir}/account.env"
+    [[ ! -f "$env_file" ]] && env_file="${acct_dir}/bot.env"
+
+    echo ""
+    echo "Running legacy script..."
+    echo ""
+
+    cd "$acct_dir"
+    bun --env-file="$(basename "$env_file")" script.ts
+
+    echo ""
+    echo "Bot exited. Press any key to continue..."
+    read -n1 -r
+}
+
+# Show detailed status
+show_status() {
+    local acct_dir="${ACCOUNTS[$SELECTED]}"
+    local name="${ACCOUNT_NAMES[$SELECTED]}"
+    local username
+    username=$(get_account_username "$acct_dir")
+
+    if [[ -z "$username" ]]; then
+        show_message "No username configured for ${name}"
+        return
+    fi
+
+    local response
+    response=$(curl -sf --max-time 3 "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${username}" 2>/dev/null) || {
+        show_message "Cannot connect to gateway"
+        return
+    }
+
+    restore_terminal
+
+    echo ""
+    echo "${BOLD}Status for ${name} (${username}):${RESET}"
+    echo ""
+    echo "$response" | sed 's/,/,\n/g' | sed 's/{/{\n/g' | sed 's/}/\n}/g'
+    echo ""
+    echo "Press any key to continue..."
+    read -n1 -r
+
+    save_terminal
+    draw_ui
+}
+
+# Create new account
+create_account() {
+    local template_dir="${ACCOUNTS_DIR}/_template"
+
+    if [[ ! -d "$template_dir" ]]; then
+        # Create template if it doesn't exist
+        mkdir -p "$template_dir"
+        cat > "${template_dir}/account.env" << 'EOF'
+# Bot Account Configuration
+BOT_USERNAME=your_username
+PASSWORD=your_password
+
+# Gateway connection
+GATEWAY_URL=ws://localhost:8245
+
+# Bot identity
+BOT_NAME=NewBot
+PERSONALITY=A friendly adventurer who enjoys helping others. Curious about the world and always happy to chat.
+
+# Ollama LLM settings (optional - uses defaults if not set)
+# OLLAMA_HOST=192.168.0.61
+# OLLAMA_PORT=16180
+# OLLAMA_MODEL=llama3.2
+EOF
+    fi
+
+    restore_terminal
+
+    echo ""
+    echo "${BOLD}Create New Account${RESET}"
+    echo "${DIM}Tip: Press ~ at any text prompt to use AI generation${RESET}"
+    echo ""
+    printf "Account name (directory name): "
+    read -r new_name
+
+    if [[ -z "$new_name" ]]; then
+        echo "Cancelled."
+        read -n1 -r
+        save_terminal
+        draw_ui
+        return
+    fi
+
+    if [[ "$new_name" =~ [^a-zA-Z0-9_-] ]]; then
+        echo "Invalid name. Use only letters, numbers, underscores, and hyphens."
+        read -n1 -r
+        save_terminal
+        draw_ui
+        return
+    fi
+
+    local new_dir="${ACCOUNTS_DIR}/${new_name}"
+    if [[ -d "$new_dir" ]]; then
+        echo "Account '${new_name}' already exists."
+        read -n1 -r
+        save_terminal
+        draw_ui
+        return
+    fi
+
+    cp -r "$template_dir" "$new_dir"
+
+    printf "Bot username: "
+    read -r bot_username
+
+    if [[ -n "$bot_username" ]]; then
+        sed -i "s/BOT_USERNAME=.*/BOT_USERNAME=${bot_username}/" "${new_dir}/account.env"
+    fi
+
+    printf "Bot password: "
+    read -rs bot_password
+    echo ""
+
+    if [[ -n "$bot_password" ]]; then
+        sed -i "s/PASSWORD=.*/PASSWORD=${bot_password}/" "${new_dir}/account.env"
+    fi
+
+    # Bot display name with AI generation support
+    local bot_name=""
+    read_with_ollama "Bot display name: " "Generating a display name for a RuneScape bot character named '$new_name'" bot_name ""
+
+    if [[ -n "$bot_name" ]]; then
+        sed -i "s/BOT_NAME=.*/BOT_NAME=${bot_name}/" "${new_dir}/account.env"
+    fi
+
+    # ==========================================================================
+    # HARDCORE MODE SELECTION
+    # ==========================================================================
+    echo ""
+    echo "${BOLD}Game Mode:${RESET}"
+    echo "  1) Normal - Standard gameplay, items despawn normally"
+    echo "  2) ${RED}HARDCORE${RESET} - Permadeath, items persist forever on ground"
+    echo ""
+    printf "Mode [1-2, default=1]: "
+    read -r game_mode
+
+    local hardcore_mode="false"
+    local show_janitor=false
+
+    if [[ "$game_mode" == "2" ]]; then
+        hardcore_mode="true"
+        show_janitor=true
+        echo ""
+        echo "${RED}⚠ HARDCORE MODE ENABLED${RESET}"
+        echo "${DIM}Death is permanent. Items stay on ground forever.${RESET}"
+        echo "${DIM}Items can only be removed by lighting fires on them.${RESET}"
+    fi
+
+    # ==========================================================================
+    # PERSONALITY SELECTION
+    # ==========================================================================
+    echo ""
+    echo "Personality presets:"
+    echo "  ${BOLD}Standard:${RESET}"
+    echo "  1) Friendly helper - Helpful, social, eager to assist"
+    echo "  2) Independent explorer - Adventurous, curious, self-directed"
+    echo "  3) Quiet worker - Diligent, focused, minimal chat"
+    echo "  4) Social butterfly - Very chatty, loves making friends"
+    echo ""
+    echo "  ${BOLD}Special:${RESET}"
+    echo "  5) Rude PvP challenger - Mean to everyone, challenges people to fight"
+    echo "  6) Toddler - Can barely operate a mouse, knows ~12 words"
+    echo "  7) Mad mage - Speaks in rhyme, unpredictable wizard"
+    echo "  8) Wise sage - Mystical, saves poetry for special moments"
+    echo "  9) Cat follower - Follows people around, meows at things"
+
+    # Show janitor option only in hardcore mode
+    if $show_janitor; then
+        echo ""
+        echo "  ${BOLD}Hardcore Only:${RESET}"
+        echo "  10) ${YELLOW}Janitor${RESET} - Cleans up death piles, burns items for XP"
+    fi
+
+    echo ""
+    echo "  0) Custom - Enter your own personality (AI generation available)"
+    echo ""
+
+    local max_choice=9
+    $show_janitor && max_choice=10
+
+    printf "Personality [0-%d, default=1]: " "$max_choice"
+    read -r personality_choice
+
+    local personality personality_preset
+    case "$personality_choice" in
+        2)
+            personality="An adventurous explorer who loves discovering new places and finding hidden treasures. Independent and curious, prefers to figure things out alone but happy to share discoveries."
+            personality_preset="independent_explorer"
+            ;;
+        3)
+            personality="A focused worker who prefers actions to words. Efficient and reliable, will help if asked but doesn't chat much. Gets the job done."
+            personality_preset="quiet_worker"
+            ;;
+        4)
+            personality="A social butterfly who loves meeting people and making friends. Chatty and warm, always ready to help or just hang out. Remembers everyone they meet."
+            personality_preset="social_butterfly"
+            ;;
+        5)
+            personality="A rude and aggressive player who insults everyone and constantly challenges people to fight in the wilderness. Will fight even at higher risk to themselves. Doesn't help anyone."
+            personality_preset="rude_pvp"
+            ;;
+        6)
+            personality="A very young player (like 2 years old) who can barely operate a mouse. Pauses for 2 seconds between decisions, sometimes moves randomly. Only knows about 12 words. Speaks like 'come... here...' or 'give me banana'."
+            personality_preset="toddler"
+            ;;
+        7)
+            personality="A mad mage who speaks in rhyme and riddles. Unpredictable and mysterious. Randomly switches between cryptic poetry and normal speech. Hides information in metaphors."
+            personality_preset="mad_mage"
+            ;;
+        8)
+            personality="A wise sage who speaks thoughtfully. Saves poetic speech for special moments: long journeys, celebrations, tragedies, and trials ahead. Otherwise speaks normally but with wisdom."
+            personality_preset="wise_sage"
+            ;;
+        9)
+            personality="A player who acts like a cat. Follows people around, meows at things they see, purrs when happy, hisses at monsters. Will ask 'can I be your cat?' to adopt a player."
+            personality_preset="cat_follower"
+            ;;
+        10)
+            if $show_janitor; then
+                personality="A dedicated janitor who cleans up death piles in cities. Wanders around collecting items from the ground, then burns them at designated burn piles for firewood XP. Only leaves the city if following another player. Takes pride in keeping towns clean."
+                personality_preset="hardcore_janitor"
+            else
+                # Fall through to default if janitor not available
+                personality="A friendly adventurer who enjoys helping others. Curious about the world and always happy to chat. Reliable and trustworthy."
+                personality_preset="friendly_helper"
+            fi
+            ;;
+        0)
+            echo ""
+            local custom_personality=""
+            read_with_ollama "Personality description: " "Creating a personality description for a RuneScape bot character. The personality should describe how they act, talk, and what they care about." custom_personality ""
+            personality="$custom_personality"
+            personality_preset=""
+            ;;
+        *)
+            personality="A friendly adventurer who enjoys helping others. Curious about the world and always happy to chat. Reliable and trustworthy."
+            personality_preset="friendly_helper"
+            ;;
+    esac
+
+    # ==========================================================================
+    # JANITOR-SPECIFIC CONFIGURATION
+    # ==========================================================================
+    if [[ "$personality_preset" == "hardcore_janitor" ]]; then
+        echo ""
+        echo "${BOLD}Janitor Configuration:${RESET}"
+        echo ""
+
+        printf "Home city (default: Lumbridge): "
+        read -r home_city
+        home_city="${home_city:-Lumbridge}"
+
+        echo ""
+        echo "Burn pile location (where items are dropped and burned):"
+        printf "  X coordinate (default: 3222): "
+        read -r burn_x
+        burn_x="${burn_x:-3222}"
+
+        printf "  Z coordinate (default: 3218): "
+        read -r burn_z
+        burn_z="${burn_z:-3218}"
+
+        printf "Collection radius from city center (default: 50): "
+        read -r collection_radius
+        collection_radius="${collection_radius:-50}"
+
+        # These will be added to account.env later
+    fi
+
+    # ==========================================================================
+    # IDENTITY QUESTIONS
+    # ==========================================================================
+
+    # Ask for birthday with AI generation
+    echo ""
+    local bot_birthday=""
+    read_with_ollama "Bot's birthday (MM-DD, or Enter to skip): " "Generate a birthday date in MM-DD format (like 03-15 for March 15th)" bot_birthday ""
+
+    # Ask for years playing (for nostalgia conversations)
+    echo ""
+    printf "Year started playing (e.g., 2004, Enter for current): "
+    read -r years_playing
+
+    if [[ -z "$years_playing" ]]; then
+        years_playing=$(date +%Y)
+    fi
+
+    # ==========================================================================
+    # BACKSTORY (Optional, AI-powered)
+    # ==========================================================================
+    echo ""
+    printf "Add backstory? (y/n, default=n): "
+    read -r add_backstory
+
+    local backstory=""
+    if [[ "$add_backstory" == "y" || "$add_backstory" == "Y" ]]; then
+        read_with_ollama "Character backstory: " "Creating a brief backstory for a RuneScape character named '${bot_name:-$new_name}' with personality: ${personality}. The backstory should be 2-3 sentences about their history, motivations, and goals." backstory ""
+    fi
+
+    # ==========================================================================
+    # WRITE CONFIGURATION
+    # ==========================================================================
+
+    if [[ -n "$personality" ]]; then
+        # Escape for sed
+        local escaped_personality
+        escaped_personality=$(printf '%s\n' "$personality" | sed 's/[&/\]/\\&/g')
+        sed -i "s/PERSONALITY=.*/PERSONALITY=${escaped_personality}/" "${new_dir}/account.env"
+    fi
+
+    # Add preset if specified
+    if [[ -n "$personality_preset" ]]; then
+        echo "" >> "${new_dir}/account.env"
+        echo "# Personality preset (affects behavior beyond just description)" >> "${new_dir}/account.env"
+        echo "PERSONALITY_PRESET=${personality_preset}" >> "${new_dir}/account.env"
+    fi
+
+    # Add birthday if specified
+    if [[ -n "$bot_birthday" ]]; then
+        echo "" >> "${new_dir}/account.env"
+        echo "# Bot's birthday (MM-DD format, for 'it's my birthday!' conversations)" >> "${new_dir}/account.env"
+        echo "BOT_BIRTHDAY=${bot_birthday}" >> "${new_dir}/account.env"
+    fi
+
+    # Add years playing
+    echo "" >> "${new_dir}/account.env"
+    echo "# Year started playing (for nostalgia chat and seniority)" >> "${new_dir}/account.env"
+    echo "PLAYING_SINCE=${years_playing}" >> "${new_dir}/account.env"
+
+    # Add backstory if provided
+    if [[ -n "$backstory" ]]; then
+        local escaped_backstory
+        escaped_backstory=$(printf '%s\n' "$backstory" | sed 's/[&/\]/\\&/g')
+        echo "" >> "${new_dir}/account.env"
+        echo "# Character backstory" >> "${new_dir}/account.env"
+        echo "BACKSTORY=${escaped_backstory}" >> "${new_dir}/account.env"
+    fi
+
+    # Add hardcore mode configuration
+    if [[ "$hardcore_mode" == "true" ]]; then
+        echo "" >> "${new_dir}/account.env"
+        echo "# ==============================================================================" >> "${new_dir}/account.env"
+        echo "# HARDCORE MODE - Death is permanent, items persist on ground" >> "${new_dir}/account.env"
+        echo "# ==============================================================================" >> "${new_dir}/account.env"
+        echo "HARDCORE_MODE=true" >> "${new_dir}/account.env"
+    fi
+
+    # Add janitor configuration if selected
+    if [[ "$personality_preset" == "hardcore_janitor" ]]; then
+        echo "" >> "${new_dir}/account.env"
+        echo "# Janitor configuration" >> "${new_dir}/account.env"
+        echo "HOME_CITY=${home_city}" >> "${new_dir}/account.env"
+        echo "BURN_PILE_X=${burn_x}" >> "${new_dir}/account.env"
+        echo "BURN_PILE_Z=${burn_z}" >> "${new_dir}/account.env"
+        echo "COLLECTION_RADIUS=${collection_radius}" >> "${new_dir}/account.env"
+    fi
+
+    echo ""
+    echo "${GREEN}Created account '${new_name}' at ${new_dir}${RESET}"
+    if [[ "$hardcore_mode" == "true" ]]; then
+        echo "${RED}⚠ HARDCORE MODE - Be careful!${RESET}"
+    fi
+    echo ""
+    echo "Press any key to continue..."
+    read -n1 -r
+
+    discover_accounts
+    save_terminal
+    draw_ui
+}
+
+# Show behaviors info
+show_behaviors() {
+    restore_terminal
+
+    echo ""
+    echo "${BOLD}Available Behaviors${RESET}"
+    echo ""
+    echo "Behaviors are reusable modules that define bot actions."
+    echo "Located in: ${BEHAVIORS_DIR}"
+    echo ""
+    echo "${BOLD}Built-in Behaviors:${RESET}"
+    echo "  idle      - Do nothing, wait passively"
+    echo "  wander    - Walk around randomly, explore"
+    echo "  follower  - Follow another player"
+    echo "  social    - Chat with nearby players"
+    echo ""
+    echo "${BOLD}New Bot Features:${RESET}"
+    echo "  - Task-based execution (priorities, interrupts, pause/resume)"
+    echo "  - Item memory (remembers ground spawns, monster drops, recipes)"
+    echo "  - Location memory (knows visited places, can ask for directions)"
+    echo "  - Timer system ('mine for 10 minutes')"
+    echo "  - Conversation topics (context-aware social interactions)"
+    echo "  - Personality traits (affects decision-making)"
+    echo ""
+    echo "${BOLD}Memory Files (per account):${RESET}"
+    echo "  accounts/\$name/memory.json    - Item knowledge"
+    echo "  accounts/\$name/locations.json - Location knowledge"
+    echo ""
+    echo "${BOLD}Legacy Bot Scripts:${RESET}"
+    for bdir in "$BOTS_DIR"/*/; do
+        [[ "$bdir" == *"/_template/"* ]] && continue
+        local bname
+        bname=$(basename "$bdir")
+        if [[ -f "${bdir}script.ts" ]]; then
+            echo "  ${bname}"
+        fi
+    done
+    echo ""
+    echo "Press any key to continue..."
+    read -n1 -r
+
+    save_terminal
+    draw_ui
+}
+
+# Show memory status for selected account
+show_memory() {
+    local acct_dir="${ACCOUNTS[$SELECTED]}"
+    local name="${ACCOUNT_NAMES[$SELECTED]}"
+
+    restore_terminal
+
+    echo ""
+    echo "${BOLD}Memory Status for ${name}${RESET}"
+    echo ""
+
+    # Item memory
+    local item_memory="${acct_dir}/memory.json"
+    if [[ -f "$item_memory" ]]; then
+        echo "${BOLD}Item Memory:${RESET} ${item_memory}"
+        echo ""
+
+        # Parse JSON and show summary
+        local ground_spawns monster_drops recipes
+        ground_spawns=$(grep -o '"groundSpawns":{[^}]*}' "$item_memory" 2>/dev/null | grep -o '"[a-z ]*"' | wc -l || echo 0)
+        monster_drops=$(grep -o '"monsterDrops":{[^}]*}' "$item_memory" 2>/dev/null | grep -o '"[a-z ]*"' | wc -l || echo 0)
+        recipes=$(grep -o '"craftingRecipes":{[^}]*}' "$item_memory" 2>/dev/null | grep -o '"[a-z ]*"' | wc -l || echo 0)
+
+        echo "  Ground spawns known: ~${ground_spawns}"
+        echo "  Monster drops known: ~${monster_drops}"
+        echo "  Crafting recipes: ~${recipes}"
+        echo ""
+    else
+        echo "${DIM}Item Memory: Not created yet${RESET}"
+        echo ""
+    fi
+
+    # Location memory
+    local location_memory="${acct_dir}/locations.json"
+    if [[ -f "$location_memory" ]]; then
+        echo "${BOLD}Location Memory:${RESET} ${location_memory}"
+        echo ""
+
+        # Parse and show summary
+        local visited
+        visited=$(grep -c '"visited":true' "$location_memory" 2>/dev/null || echo 0)
+        local total
+        total=$(grep -c '"name":' "$location_memory" 2>/dev/null || echo 0)
+
+        echo "  Locations visited: ${visited}"
+        echo "  Total locations known: ${total}"
+        echo ""
+
+        # Show recent visits
+        echo "  ${BOLD}Sample locations:${RESET}"
+        grep -o '"name":"[^"]*"' "$location_memory" 2>/dev/null | head -5 | sed 's/"name":"/ - /g' | sed 's/"//g'
+        echo ""
+    else
+        echo "${DIM}Location Memory: Not created yet${RESET}"
+        echo ""
+    fi
+
+    echo "Press any key to continue..."
+    read -n1 -r
+
+    save_terminal
+    draw_ui
+}
+
+# Read a single keypress
+read_key() {
+    local key
+    IFS= read -rsn1 key
+
+    if [[ "$key" == $'\x1b' ]]; then
+        read -rsn1 -t 0.1 key2
+        read -rsn1 -t 0.1 key3
+        case "${key2}${key3}" in
+            "[A") echo "UP" ;;
+            "[B") echo "DOWN" ;;
+            *)    echo "ESC" ;;
+        esac
+    else
+        echo "$key"
+    fi
+}
+
+# Main loop
+main() {
+    discover_accounts
+
+    if [[ ${#ACCOUNTS[@]} -eq 0 ]]; then
+        echo "No accounts found in ${ACCOUNTS_DIR} or ${BOTS_DIR}"
+        echo "Create an account with 'n' in the manager, or manually create a directory."
+        exit 1
+    fi
+
+    save_terminal
+    draw_ui
+
+    while $RUNNING; do
+        local key
+        key=$(read_key)
+
+        case "$key" in
+            "UP"|"k")
+                if [[ $SELECTED -gt 0 ]]; then
+                    local old_sel=$SELECTED
+                    ((SELECTED--))
+                    update_selection "$old_sel" "$SELECTED"
+                fi
+                ;;
+            "DOWN"|"j")
+                if [[ $SELECTED -lt $((${#ACCOUNTS[@]} - 1)) ]]; then
+                    local old_sel=$SELECTED
+                    ((SELECTED++))
+                    update_selection "$old_sel" "$SELECTED"
+                fi
+                ;;
+            ""|"l")
+                launch_account
+                ;;
+            "s")
+                show_status
+                ;;
+            "m")
+                show_memory
+                ;;
+            "b")
+                show_behaviors
+                ;;
+            "r")
+                discover_accounts
+                show_message "Refreshed account list"
+                draw_ui
+                ;;
+            "n")
+                create_account
+                ;;
+            "q"|"ESC")
+                RUNNING=false
+                ;;
+        esac
+    done
+}
+
+main "$@"

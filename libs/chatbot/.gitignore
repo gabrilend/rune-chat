@@ -1,0 +1,37 @@
+# External libraries (installed from source via scripts/install-libs.sh)
+libs/cJSON/
+libs/luasocket/
+libs/raylib-wayland/
+libs/lib/
+libs/share/
+
+# Build artifacts
+.build/
+*.o
+*.so
+*.a
+
+# Generated files
+images/
+*.log
+readline_debug.log
+
+# Runtime
+.chat_initialized
+.chat_sessions/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# C wrapper build artifacts
+wrappers/c/*.o
+wrappers/c/*.a
+wrappers/c/example

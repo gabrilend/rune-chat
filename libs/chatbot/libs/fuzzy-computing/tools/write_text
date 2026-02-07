@@ -1,0 +1,341 @@
+#!/usr/bin/env luajit
+
+-- Set up library path relative to script location (script is in libs/tools/)
+local script_dir = arg[0]:match("(.*/)")  or "./"
+package.path = script_dir .. "../../?.lua;" .. script_dir .. "../?.lua;" .. package.path
+
+local json = require("dkjson")
+
+-- Comment style mapping for code files (Lua, C, Bash only)
+local comment_styles = {
+    lua = "--",
+    c = "//", h = "//",
+    sh = "#", bash = "#",
+}
+
+-- Tool metadata
+local tool_info = {
+    name = "write_text",
+    description = "Write text content to a file outside the src/ directory. " ..
+                  "Use this for documentation, notes, config files, or adding comments to code files. " ..
+                  "If the target file has a code extension (.lua, .c, .h, .sh, .bash), " ..
+                  "the text will automatically be formatted as comments. " ..
+                  "This tool CANNOT write to src/ - use write_code for source files.",
+    parameters = {
+        type = "object",
+        properties = {
+            filename = {
+                type = "string",
+                description = "The filename to write (e.g., 'notes.txt', 'docs/readme.md', 'examples/demo.lua'). Cannot be in src/."
+            },
+            content = {
+                type = "string",
+                description = "The text content to write. Will be auto-formatted as comments if file has a code extension."
+            },
+            line_number = {
+                type = "number",
+                description = "Optional: insert content at this line number (1-indexed). File must exist. If omitted, creates/overwrites entire file."
+            }
+        },
+        required = {"filename", "content"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Read JSON input from stdin
+local input = io.read("*a")
+local params, pos, err = json.decode(input)
+
+if not params then
+    print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+    os.exit(1)
+end
+
+local filename = params.filename
+local content = params.content
+local line_number = params.line_number
+local project_dir = params._project_dir or "."
+
+if not filename or not content then
+    print(json.encode({success = false, error = "Missing required parameters: filename and content"}))
+    os.exit(1)
+end
+
+-- Security: sanitize filename to prevent path traversal and shell injection
+local function sanitize_path(path)
+    local violations = {}
+    local original = path
+
+    -- Remove null bytes
+    if path:match("%z") then
+        table.insert(violations, "null bytes")
+        path = path:gsub("%z", "")
+    end
+
+    -- Remove or neutralize dangerous patterns
+    if path:match("%.%.") then
+        table.insert(violations, "'../' parent directory traversal")
+        path = path:gsub("%.%.", "")
+    end
+    if path:match("^~/") or path:match("^~$") then
+        table.insert(violations, "'~/' home directory expansion")
+        path = path:gsub("^~/", "")
+        path = path:gsub("^~", "")
+    end
+    if path:match("^/") then
+        table.insert(violations, "absolute path starting with '/'")
+        path = path:gsub("^/", "")
+    end
+    if path:match("%$[%w_]") or path:match("%$%b{}") then
+        table.insert(violations, "'$VAR' or '${VAR}' environment variable expansion")
+        path = path:gsub("%$[%w_]*", "")
+        path = path:gsub("%$%b{}", "")
+    end
+    if path:match("`.-`") or path:match("%$%(.-%)") then
+        table.insert(violations, "'`cmd`' or '$(cmd)' command substitution")
+        path = path:gsub("`.-`", "")
+        path = path:gsub("%$%(.-%)","")
+    end
+
+    -- Normalize (not a violation, just cleanup)
+    path = path:gsub("\\", "/")            -- normalize backslashes
+    path = path:gsub("/+", "/")            -- collapse multiple slashes
+    path = path:gsub("^/", "")             -- remove leading slash (again, after collapse)
+    path = path:gsub("/$", "")             -- remove trailing slash
+
+    return path, violations, original
+end
+
+local sanitized_filename, violations, original_filename = sanitize_path(filename)
+filename = sanitized_filename
+
+-- Report violations to help LLM learn
+if #violations > 0 then
+    print(json.encode({
+        success = false,
+        error = "Filename contained unsafe patterns that were rejected",
+        violations = violations,
+        original_filename = original_filename,
+        suggestion = "Use simple relative paths like 'notes.txt' or 'docs/readme.md'. Do not use: parent traversal (..), home directory (~), absolute paths (/), environment variables ($VAR), or command substitution (`cmd` or $(cmd))."
+    }))
+    os.exit(1)
+end
+
+-- Reject if filename is empty after sanitization
+if filename == "" then
+    print(json.encode({success = false, error = "Invalid filename: empty after sanitization"}))
+    os.exit(1)
+end
+
+-- Enforce NOT in src/ directory
+if filename:match("^src/") or filename:match("^src$") then
+    print(json.encode({
+        success = false,
+        error = "write_text cannot write to src/ directory",
+        attempted_path = filename,
+        suggestion = "Use write_code for files in src/, or change filename to '" ..
+            filename:gsub("^src/", "") .. "' (will write to project root)"
+    }))
+    os.exit(1)
+end
+
+-- Build full path relative to project directory
+local full_path = project_dir .. "/" .. filename
+
+-- Ensure parent directory exists
+local parent_dir = full_path:match("(.*/)")
+if parent_dir then
+    os.execute('mkdir -p "' .. parent_dir .. '"')
+end
+
+-- Get file extension
+local function get_extension(path)
+    local ext = path:match("%.([^%.]+)$")
+    return ext and ext:lower() or nil
+end
+
+-- Wrap content as comments if file has a code extension
+local function wrap_as_comment(text, extension)
+    local prefix = comment_styles[extension]
+    if not prefix then return text end
+
+    local lines = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        if line == "" then
+            table.insert(lines, prefix)
+        else
+            table.insert(lines, prefix .. " " .. line)
+        end
+    end
+    -- Remove trailing comment if content didn't end with newline
+    if not text:match("\n$") and #lines > 0 then
+        -- Keep all lines, they're real content
+    end
+    return table.concat(lines, "\n")
+end
+
+-- Read existing file lines
+local function read_file_lines(path)
+    local lines = {}
+    local file = io.open(path, "r")
+    if file then
+        for line in file:lines() do
+            table.insert(lines, line)
+        end
+        file:close()
+        return lines, true
+    end
+    return lines, false
+end
+
+-- Insert content at line number
+local function insert_at_line(existing_lines, new_content, line_num)
+    -- Split new content into lines
+    local new_lines = {}
+    for line in (new_content .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(new_lines, line)
+    end
+    -- Remove trailing empty line if content didn't end with newline
+    if not new_content:match("\n$") and #new_lines > 0 and new_lines[#new_lines] == "" then
+        table.remove(new_lines)
+    end
+
+    -- Build result: lines before insert point, new lines, lines from insert point onward
+    local result = {}
+    for i = 1, line_num - 1 do
+        table.insert(result, existing_lines[i] or "")
+    end
+    for _, line in ipairs(new_lines) do
+        table.insert(result, line)
+    end
+    for i = line_num, #existing_lines do
+        table.insert(result, existing_lines[i])
+    end
+
+    return result
+end
+
+-- Apply comment wrapping if needed
+local ext = get_extension(filename)
+local processed_content = wrap_as_comment(content, ext)
+local was_commented = (processed_content ~= content)
+
+-- Handle line insertion vs full overwrite
+local final_content
+local total_existing_lines = 0
+
+if line_number then
+    -- Validate line number
+    if line_number < 1 then
+        print(json.encode({
+            success = false,
+            error = "Line number must be at least 1",
+            requested_line = line_number,
+            suggestion = "Use a line number >= 1, or omit line_number to overwrite/create the file"
+        }))
+        os.exit(1)
+    end
+
+    local existing_lines, file_existed = read_file_lines(full_path)
+    total_existing_lines = #existing_lines
+
+    if not file_existed then
+        print(json.encode({
+            success = false,
+            error = "Cannot insert at line: file does not exist",
+            filename = filename,
+            requested_line = line_number,
+            suggestion = "Omit line_number to create a new file, or check the filename"
+        }))
+        os.exit(1)
+    end
+
+    -- For insertion, allow line_number up to total_lines + 1 (append)
+    if line_number > total_existing_lines + 1 then
+        print(json.encode({
+            success = false,
+            error = string.format("Line number %d is out of range", line_number),
+            filename = filename,
+            total_lines = total_existing_lines,
+            requested_line = line_number,
+            suggestion = string.format("Use a line number between 1 and %d, or omit line_number to overwrite the file", total_existing_lines + 1)
+        }))
+        os.exit(1)
+    end
+
+    local result_lines = insert_at_line(existing_lines, processed_content, line_number)
+    final_content = table.concat(result_lines, "\n")
+else
+    final_content = processed_content
+end
+
+-- Write the file
+local file, write_err = io.open(full_path, "w")
+if not file then
+    print(json.encode({success = false, error = "Failed to open file: " .. tostring(write_err)}))
+    os.exit(1)
+end
+
+file:write(final_content)
+file:close()
+
+-- Auto-lint .md and .txt files
+local lintable_extensions = {md = true, txt = true}
+local was_linted = false
+local lint_error = nil
+
+if ext and lintable_extensions[ext] then
+    local lint_tool = script_dir .. "lint_docs"
+    local lint_cmd = string.format('%s "%s" 2>&1', lint_tool, full_path)
+    local handle = io.popen(lint_cmd)
+    if handle then
+        local output = handle:read("*a")
+        local success = handle:close()
+        if success then
+            was_linted = true
+            -- Re-read the file to get updated stats after linting
+            local linted_file = io.open(full_path, "r")
+            if linted_file then
+                final_content = linted_file:read("*a")
+                linted_file:close()
+            end
+        else
+            lint_error = output:gsub("%s+$", "")
+        end
+    end
+end
+
+-- Get file info (after potential linting)
+local line_count = select(2, final_content:gsub("\n", "\n")) + 1
+local byte_count = #final_content
+
+-- Success message
+local message
+local comment_note = was_commented and " (auto-formatted as comments)" or ""
+local lint_note = was_linted and " (auto-linted)" or ""
+
+if line_number then
+    local inserted_lines = select(2, processed_content:gsub("\n", "\n")) + 1
+    message = string.format("Inserted %d lines at line %d in %s%s%s (now %d lines, %d bytes)",
+        inserted_lines, line_number, full_path, comment_note, lint_note, line_count, byte_count)
+else
+    message = string.format("Wrote %d lines (%d bytes) to %s%s%s", line_count, byte_count, full_path, comment_note, lint_note)
+end
+
+local result = {
+    success = true,
+    message = message,
+    auto_commented = was_commented,
+    auto_linted = was_linted
+}
+
+if lint_error then
+    result.lint_warning = "Linting failed: " .. lint_error
+end
+
+print(json.encode(result))

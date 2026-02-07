@@ -1,0 +1,733 @@
+#!/usr/bin/env luajit
+
+--[[
+  generate_image - Generate images using ComfyUI and Stable Diffusion
+
+  Features:
+  - Accepts positive and negative prompts
+  - Uses configurable workflow template
+  - Saves generated images to configured directory
+
+  Usage (CLI):     ./generate_image --prompt "a red apple"
+  Usage (LLM):     echo '{"prompt": "a red apple"}' | ./generate_image
+
+  Configuration in chat_config.lua:
+    config.image_generation = {
+        host = "192.168.0.61",
+        port = 8123,
+        output_dir = "images",
+        workflow_file = "comfyui_workflow.json",
+        ...
+    }
+]]
+
+local script_dir = arg[0]:match("(.*/)") or "./"
+
+-- Add libs to package path (script is in libs/fuzzy-computing/tools/)
+package.path = script_dir .. "../../?.lua;" ..              -- libs/ for dkjson
+               script_dir .. "../?.lua;" ..                  -- fuzzy-computing/ for config_loader
+               script_dir .. "../../luasocket/share/lua/5.1/?.lua;" ..
+               package.path
+package.cpath = script_dir .. "../../luasocket/lib/lua/5.1/?.so;" ..
+                script_dir .. "../../luasocket/lib/lua/5.1/socket/?.so;" ..
+                package.cpath
+
+local json = require("dkjson")
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+local socket = require("socket")
+local config_loader = require("chat_config_loader")
+
+-- Base64 encoding table
+local b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+-- Base64 encode a string
+local function base64_encode(data)
+    return ((data:gsub('.', function(x)
+        local r, b = '', x:byte()
+        for i = 8, 1, -1 do r = r .. (b % 2 ^ i - b % 2 ^ (i - 1) > 0 and '1' or '0') end
+        return r
+    end) .. '0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if #x < 6 then return '' end
+        local c = 0
+        for i = 1, 6 do c = c + (x:sub(i, i) == '1' and 2 ^ (6 - i) or 0) end
+        return b64chars:sub(c + 1, c + 1)
+    end) .. ({ '', '==', '=' })[#data % 3 + 1])
+end
+
+-- Read and base64 encode an image file
+local function encode_image_file(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read("*a")
+    f:close()
+    return base64_encode(data)
+end
+
+-- Tool metadata
+local tool_info = {
+    name = "generate_image",
+    description = "Generate a creative/artistic image using Stable Diffusion AI. " ..
+                  "Use this ONLY for visual art, photos, illustrations, or creative imagery " ..
+                  "that cannot be represented as text. " ..
+                  "DO NOT use this for: tables, charts, diagrams, code, text formatting, or " ..
+                  "anything that should be output as markdown/text. " ..
+                  "The generated image will be displayed in the terminal.",
+    parameters = {
+        type = "object",
+        properties = {
+            prompt = {
+                type = "string",
+                description = "Visual scene to generate (e.g., 'a cat on a windowsill at sunset, photorealistic'). " ..
+                              "Must describe visual/artistic content, not text or data."
+            },
+            negative = {
+                type = "string",
+                description = "What to exclude (e.g., 'blurry, low quality, text, watermark')"
+            },
+            filename = {
+                type = "string",
+                description = "Output filename without extension. Defaults to timestamp."
+            }
+        },
+        required = {"prompt"}
+    }
+}
+
+-- Handle --tool-info flag
+if arg[1] == "--tool-info" then
+    print(json.encode(tool_info))
+    os.exit(0)
+end
+
+-- Default image generation config
+local DEFAULT_CONFIG = {
+    host = "192.168.0.61",
+    port = 8123,
+    output_dir = "images",
+    workflow_file = "comfyui_workflow.json",
+    width = 512,
+    height = 512,
+    positive_prompt_node = "6",
+    negative_prompt_node = "7",
+    sampler_node = "3",
+    timeout = 120,
+    poll_interval = 1,
+    vision = {
+        enabled = true,
+        model = "moondream",
+        prompt_template = 'Describe this AI-generated image in 2-3 sentences. Focus on the main subject, composition, and style.\n\nThe image was generated from this prompt: "{prompt}"\n\nIf anything in the image differs noticeably from what the prompt requested (missing elements, different style, unexpected additions), briefly note those differences in 1-2 sentences. If the image matches the prompt well, no need to mention differences.',
+        timeout = 30,
+    },
+}
+
+-- Deep merge tables
+local function merge_tables(base, override)
+    local result = {}
+    for k, v in pairs(base) do
+        if type(v) == "table" and type(override[k]) == "table" then
+            result[k] = merge_tables(v, override[k])
+        elseif override[k] ~= nil then
+            result[k] = override[k]
+        else
+            result[k] = v
+        end
+    end
+    for k, v in pairs(override) do
+        if result[k] == nil then
+            result[k] = v
+        end
+    end
+    return result
+end
+
+-- Load configuration
+local function load_config(project_dir)
+    local chat_config = config_loader.load(project_dir)
+    local img_config = chat_config.image_generation or {}
+    return merge_tables(DEFAULT_CONFIG, img_config)
+end
+
+-- Make HTTP GET request
+local function http_get(url)
+    local response_body = {}
+    local result, status_code, headers = http.request{
+        url = url,
+        sink = ltn12.sink.table(response_body),
+    }
+
+    if not result then
+        return nil, "HTTP request failed: " .. tostring(status_code)
+    end
+
+    return table.concat(response_body), status_code
+end
+
+-- Make HTTP POST request with JSON body
+local function http_post_json(url, data)
+    local request_body = json.encode(data)
+    local response_body = {}
+
+    local result, status_code, headers = http.request{
+        url = url,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = #request_body,
+        },
+        source = ltn12.source.string(request_body),
+        sink = ltn12.sink.table(response_body),
+    }
+
+    if not result then
+        return nil, "HTTP request failed: " .. tostring(status_code)
+    end
+
+    return table.concat(response_body), status_code
+end
+
+-- Load workflow JSON from file
+local function load_workflow(workflow_path)
+    local f = io.open(workflow_path, "r")
+    if not f then
+        return nil, "Workflow file not found: " .. workflow_path
+    end
+
+    local content = f:read("*a")
+    f:close()
+
+    local workflow, pos, err = json.decode(content)
+    if not workflow then
+        return nil, "Invalid workflow JSON: " .. tostring(err)
+    end
+
+    return workflow
+end
+
+-- Inject prompts into workflow
+local function inject_prompts(workflow, config, positive, negative)
+    -- Set positive prompt
+    if workflow[config.positive_prompt_node] then
+        workflow[config.positive_prompt_node].inputs.text = positive
+    else
+        return nil, "Positive prompt node '" .. config.positive_prompt_node .. "' not found in workflow"
+    end
+
+    -- Set negative prompt (if node exists and negative provided)
+    if negative and negative ~= "" and workflow[config.negative_prompt_node] then
+        workflow[config.negative_prompt_node].inputs.text = negative
+    end
+
+    -- Randomize seed in sampler node
+    if workflow[config.sampler_node] and workflow[config.sampler_node].inputs then
+        workflow[config.sampler_node].inputs.seed = math.random(0, 2147483647)
+    end
+
+    -- Set dimensions if EmptyLatentImage node exists (typically node "5")
+    for node_id, node in pairs(workflow) do
+        if node.class_type == "EmptyLatentImage" then
+            node.inputs.width = config.width
+            node.inputs.height = config.height
+        end
+    end
+
+    return workflow
+end
+
+-- Queue prompt to ComfyUI
+local function queue_prompt(config, workflow)
+    local url = string.format("http://%s:%d/prompt", config.host, config.port)
+    local data = {
+        prompt = workflow,
+        client_id = "chatbot-generate-image"
+    }
+
+    local response, status = http_post_json(url, data)
+    if not response then
+        return nil, status
+    end
+
+    if status ~= 200 then
+        return nil, "ComfyUI returned status " .. tostring(status) .. ": " .. response
+    end
+
+    local result, pos, err = json.decode(response)
+    if not result then
+        return nil, "Invalid response from ComfyUI: " .. tostring(err)
+    end
+
+    if result.error then
+        local error_msg = result.error
+        if result.node_errors then
+            error_msg = error_msg .. " - Node errors: " .. json.encode(result.node_errors)
+        end
+        return nil, error_msg
+    end
+
+    return result.prompt_id
+end
+
+-- Check history for prompt completion
+local function check_history(config, prompt_id)
+    local url = string.format("http://%s:%d/history/%s", config.host, config.port, prompt_id)
+
+    local response, status = http_get(url)
+    if not response then
+        return nil, status
+    end
+
+    local result, pos, err = json.decode(response)
+    if not result then
+        return nil, "Invalid history response: " .. tostring(err)
+    end
+
+    -- Check if our prompt_id is in the history
+    if result[prompt_id] and result[prompt_id].outputs then
+        return result[prompt_id]
+    end
+
+    return nil -- Not ready yet
+end
+
+-- Download image from ComfyUI
+local function download_image(config, filename, subfolder, img_type)
+    local url = string.format(
+        "http://%s:%d/view?filename=%s&subfolder=%s&type=%s",
+        config.host, config.port,
+        filename,
+        subfolder or "",
+        img_type or "output"
+    )
+
+    local response_body = {}
+    local result, status_code, headers = http.request{
+        url = url,
+        sink = ltn12.sink.table(response_body),
+    }
+
+    if not result or status_code ~= 200 then
+        return nil, "Failed to download image: " .. tostring(status_code)
+    end
+
+    return table.concat(response_body)
+end
+
+-- Check if a model supports vision via Ollama API
+local function model_supports_vision(model_name, chat_config)
+    local ollama_host = chat_config.host or "192.168.0.61"
+    local ollama_port = chat_config.port or 11434
+    local url = string.format("http://%s:%d/api/show", ollama_host, ollama_port)
+
+    local request_body = json.encode({name = model_name})
+    local response_body = {}
+
+    local result, status_code = http.request{
+        url = url,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = #request_body,
+        },
+        source = ltn12.source.string(request_body),
+        sink = ltn12.sink.table(response_body),
+    }
+
+    if not result or status_code ~= 200 then
+        return false
+    end
+
+    local response_text = table.concat(response_body)
+    local ok, info = pcall(json.decode, response_text)
+    if not ok or not info then
+        return false
+    end
+
+    -- Check for vision capability indicators:
+    -- 1. projector_info field exists (used by LLaVA-style models)
+    if info.projector_info then
+        return true
+    end
+
+    -- 2. Model details families includes vision-related families
+    if info.details and info.details.families then
+        for _, family in ipairs(info.details.families) do
+            local lower = family:lower()
+            if lower:match("clip") or lower:match("llava") or lower:match("vision") then
+                return true
+            end
+        end
+    end
+
+    -- 3. Check model name for common vision model patterns
+    local lower_name = model_name:lower()
+    if lower_name:match("llava") or lower_name:match("moondream") or
+       lower_name:match("bakllava") or lower_name:match("cogvlm") or
+       lower_name:match("minicpm%-v") or lower_name:match("llama3.2%-vision") then
+        return true
+    end
+
+    return false
+end
+
+-- Get vision description of an image using a vision-capable model
+local function get_vision_description(image_path, chat_config, img_config, original_prompt)
+    local vision_config = img_config.vision
+    if not vision_config or not vision_config.enabled then
+        return nil
+    end
+
+    -- Encode the image
+    local image_b64 = encode_image_file(image_path)
+    if not image_b64 then
+        return nil, "Failed to encode image for vision model"
+    end
+
+    -- Build the prompt, substituting {prompt} placeholder with original generation prompt
+    local vision_prompt
+    if vision_config.prompt_template then
+        vision_prompt = vision_config.prompt_template:gsub("{prompt}", original_prompt or "unknown")
+    elseif vision_config.prompt then
+        -- Legacy support for old 'prompt' field
+        vision_prompt = vision_config.prompt
+    else
+        vision_prompt = "Describe this image."
+    end
+
+    -- Build request to Ollama
+    local ollama_host = chat_config.host or "192.168.0.61"
+    local ollama_port = chat_config.port or 11434
+    local url = string.format("http://%s:%d/api/chat", ollama_host, ollama_port)
+
+    local request_data = {
+        model = vision_config.model,
+        messages = {
+            {
+                role = "user",
+                content = vision_prompt,
+                images = {image_b64}
+            }
+        },
+        stream = false
+    }
+
+    local request_body = json.encode(request_data)
+    local response_body = {}
+
+    -- Set timeout for vision request
+    http.TIMEOUT = vision_config.timeout or 30
+
+    local result, status_code, headers = http.request{
+        url = url,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = #request_body,
+        },
+        source = ltn12.source.string(request_body),
+        sink = ltn12.sink.table(response_body),
+    }
+
+    if not result then
+        return nil, "Vision request failed: " .. tostring(status_code)
+    end
+
+    if status_code ~= 200 then
+        return nil, "Vision model returned status " .. tostring(status_code)
+    end
+
+    local response_text = table.concat(response_body)
+    local ok, response = pcall(json.decode, response_text)
+    if not ok or not response then
+        return nil, "Invalid response from vision model"
+    end
+
+    if response.message and response.message.content then
+        return response.message.content
+    end
+
+    return nil, "No content in vision model response"
+end
+
+-- Generate image (main logic)
+local function generate_image(prompt, negative, output_filename, project_dir)
+    project_dir = project_dir or "./"
+    local config = load_config(project_dir)
+
+    -- Find workflow file
+    local workflow_paths = {
+        project_dir .. "/" .. config.workflow_file,
+        project_dir .. "/libs/fuzzy-computing/config/" .. config.workflow_file,
+        script_dir .. "../config/" .. config.workflow_file,
+    }
+
+    local workflow, workflow_err
+    for _, path in ipairs(workflow_paths) do
+        workflow, workflow_err = load_workflow(path)
+        if workflow then break end
+    end
+
+    if not workflow then
+        return false, "Workflow file not found. Export from ComfyUI (Save API Format) and save as '" ..
+                      config.workflow_file .. "'. Searched: " .. table.concat(workflow_paths, ", ")
+    end
+
+    -- Inject prompts
+    local modified_workflow, inject_err = inject_prompts(workflow, config, prompt, negative or "")
+    if not modified_workflow then
+        return false, inject_err
+    end
+
+    -- Queue the prompt
+    local prompt_id, queue_err = queue_prompt(config, modified_workflow)
+    if not prompt_id then
+        return false, "Failed to queue prompt: " .. queue_err
+    end
+
+    -- Poll for completion
+    local start_time = socket.gettime()
+    local history
+    while (socket.gettime() - start_time) < config.timeout do
+        history = check_history(config, prompt_id)
+        if history then break end
+        socket.sleep(config.poll_interval)
+    end
+
+    if not history then
+        return false, "Image generation timed out after " .. config.timeout .. " seconds"
+    end
+
+    -- Find output image in history
+    local output_images = {}
+    for node_id, node_output in pairs(history.outputs) do
+        if node_output.images then
+            for _, img in ipairs(node_output.images) do
+                table.insert(output_images, img)
+            end
+        end
+    end
+
+    if #output_images == 0 then
+        return false, "No images found in generation output"
+    end
+
+    -- Download the first output image
+    local img = output_images[1]
+    local image_data, download_err = download_image(config, img.filename, img.subfolder, img.type)
+    if not image_data then
+        return false, download_err
+    end
+
+    -- Determine output filename
+    if not output_filename or output_filename == "" then
+        output_filename = os.date("%Y%m%d_%H%M%S")
+    end
+
+    -- Ensure output directory exists
+    local output_dir = project_dir .. "/" .. config.output_dir
+    os.execute('mkdir -p "' .. output_dir .. '"')
+
+    -- Determine extension from original filename
+    local ext = img.filename:match("%.([^%.]+)$") or "png"
+    local output_path = output_dir .. "/" .. output_filename .. "." .. ext
+
+    -- Save image
+    local f = io.open(output_path, "wb")
+    if not f then
+        return false, "Failed to save image to: " .. output_path
+    end
+    f:write(image_data)
+    f:close()
+
+    -- Load chat config and check if main model supports vision
+    local chat_config = config_loader.load(project_dir)
+    local main_model = chat_config.model or "nemotron-3-nano"
+    local main_model_has_vision = model_supports_vision(main_model, chat_config)
+
+    local vision_description, vision_err
+    local use_vision_fallback = false
+
+    if main_model_has_vision then
+        -- Main model can see images - no need for description fallback
+        -- The image will be passed directly to context via display_image
+        vision_description = nil
+    elseif config.vision and config.vision.enabled then
+        -- Main model can't see images - use vision model to describe it
+        use_vision_fallback = true
+        vision_description, vision_err = get_vision_description(output_path, chat_config, config, prompt)
+    end
+
+    return true, output_path, {
+        prompt_id = prompt_id,
+        size = #image_data,
+        dimensions = config.width .. "x" .. config.height,
+        image_description = vision_description,
+        vision_error = vision_err,
+        main_model_has_vision = main_model_has_vision,
+    }
+end
+
+-- Detect terminal type for image display
+local function detect_terminal()
+    -- Check for Kitty
+    if os.getenv("KITTY_WINDOW_ID") then
+        return "kitty"
+    end
+    -- Check for Ghostty (also supports Kitty protocol)
+    if os.getenv("GHOSTTY_RESOURCES_DIR") then
+        return "ghostty"
+    end
+    -- Check TERM for other hints
+    local term = os.getenv("TERM") or ""
+    if term:match("kitty") then
+        return "kitty"
+    end
+    if term:match("xterm") or term:match("st") or term == "linux" then
+        return "basic"
+    end
+    return "basic"
+end
+
+-- Display image in terminal
+local function display_image(image_path)
+    local terminal = detect_terminal()
+
+    if terminal == "kitty" or terminal == "ghostty" then
+        -- Use Kitty graphics protocol via kitten
+        local cmd = string.format('kitty +kitten icat --clear "%s" 2>/dev/null', image_path)
+        local result = os.execute(cmd)
+        if not result then
+            -- Fallback if kitten not available
+            cmd = string.format('img2txt -W 80 -H 40 "%s" 2>/dev/null', image_path)
+            os.execute(cmd)
+        end
+    else
+        -- Use img2txt (libcaca) for basic terminals like st
+        local cmd = string.format('img2txt -W 80 -H 40 "%s" 2>/dev/null', image_path)
+        local result = os.execute(cmd)
+        if not result then
+            -- Final fallback - just mention the file
+            io.stderr:write("(Install libcaca-utils for terminal image preview)\n")
+        end
+    end
+end
+
+-- Main function
+local function main()
+    local prompt = nil
+    local negative = nil
+    local output_filename = nil
+    local project_dir = "./"
+    local is_tool_mode = false
+
+    -- Check for CLI arguments
+    if #arg >= 1 and arg[1] ~= "" then
+        -- CLI mode: ./generate_image --prompt "..." [--negative "..."] [--output "..."]
+        local i = 1
+        while i <= #arg do
+            if arg[i] == "--prompt" and arg[i+1] then
+                prompt = arg[i+1]
+                i = i + 2
+            elseif arg[i] == "--negative" and arg[i+1] then
+                negative = arg[i+1]
+                i = i + 2
+            elseif arg[i] == "--output" and arg[i+1] then
+                output_filename = arg[i+1]
+                i = i + 2
+            else
+                -- Assume it's the prompt if no flag
+                if not prompt then
+                    prompt = arg[i]
+                end
+                i = i + 1
+            end
+        end
+    else
+        -- LLM tool mode: read JSON from stdin
+        local input = io.read("*a")
+        if input and input ~= "" then
+            local params, pos, err = json.decode(input)
+            if params then
+                is_tool_mode = true
+                prompt = params.prompt
+                negative = params.negative
+                output_filename = params.filename
+                project_dir = params._project_dir or "./"
+            else
+                print(json.encode({success = false, error = "Invalid JSON input: " .. tostring(err)}))
+                os.exit(1)
+            end
+        end
+    end
+
+    -- Validate prompt
+    if not prompt or prompt == "" then
+        if is_tool_mode then
+            print(json.encode({success = false, error = "Missing required parameter: prompt"}))
+        else
+            io.stderr:write("Usage: generate_image --prompt \"description of image\"\n")
+            io.stderr:write("       generate_image --prompt \"...\" --negative \"things to exclude\"\n")
+            io.stderr:write("       generate_image --prompt \"...\" --output \"filename\"\n")
+        end
+        os.exit(1)
+    end
+
+    -- Initialize random seed
+    math.randomseed(os.time())
+
+    -- Generate the image
+    local success, result, stats = generate_image(prompt, negative, output_filename, project_dir)
+
+    if is_tool_mode then
+        if success then
+            -- Build message with context about how the LLM will see the image
+            local message = string.format("Generated image saved to: %s (%s, %d bytes). " ..
+                "The image has been displayed to the user in their terminal.",
+                result, stats.dimensions, stats.size)
+
+            if stats.main_model_has_vision then
+                -- Main model can see images directly
+                message = message .. "\n\nThe image has been added to our conversation context - you can see it directly."
+            elseif stats.image_description then
+                -- Fallback: vision model described the image
+                message = message .. "\n\nVision model description of the generated image:\n" ..
+                    stats.image_description
+            elseif stats.vision_error then
+                message = message .. "\n\n(Vision description unavailable: " .. stats.vision_error .. ")"
+            end
+
+            -- In tool mode, output clean JSON (chatbot expects this)
+            print(json.encode({
+                success = true,
+                message = message,
+                file = result,
+                prompt_id = stats.prompt_id,
+                dimensions = stats.dimensions,
+                size = stats.size,
+                image_description = stats.image_description,
+                main_model_has_vision = stats.main_model_has_vision,
+                display_image = result,  -- Signal to UI to display this image
+            }))
+        else
+            print(json.encode({success = false, error = result}))
+        end
+    else
+        if success then
+            print(string.format("Generated: %s (%s, %d bytes)", result, stats.dimensions, stats.size))
+            -- Display image in terminal (CLI mode only)
+            display_image(result)
+            -- Show vision info
+            if stats.main_model_has_vision then
+                print("\n(Main model supports vision - image will be passed to context)")
+            elseif stats.image_description then
+                print("\nVision description: " .. stats.image_description)
+            elseif stats.vision_error then
+                io.stderr:write("(Vision: " .. stats.vision_error .. ")\n")
+            end
+        else
+            io.stderr:write("Error: " .. result .. "\n")
+            os.exit(1)
+        end
+    end
+end
+
+main()
