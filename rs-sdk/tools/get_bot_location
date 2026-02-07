@@ -1,0 +1,75 @@
+#!/bin/bash
+# get_bot_location - Get precise world coordinates for a bot
+# Protocol: --tool-info for JSON schema, stdin for execution args
+
+GATEWAY_HOST="${GATEWAY_HOST:-localhost}"
+GATEWAY_PORT="${GATEWAY_PORT:-8245}"
+
+if [[ "$1" == "--tool-info" ]]; then
+    cat << 'EOF'
+{"name": "get_bot_location", "description": "Get the precise world coordinates (X, Z) for a specific bot. Returns the bot's current position if online and in-game.", "parameters": {"type": "object", "properties": {"username": {"type": "string", "description": "The bot's username to get location for"}}, "required": ["username"]}}
+EOF
+    exit 0
+fi
+
+# Read JSON input from stdin
+input=$(cat)
+
+# Extract username using sed (basic JSON parsing without jq)
+username=$(echo "$input" | sed -n 's/.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+if [[ -z "$username" ]]; then
+    echo '{"success": false, "error": "Missing required parameter: username"}'
+    exit 0
+fi
+
+# URL-encode the username
+encoded_username=$(echo -n "$username" | sed 's/ /%20/g; s/!/%21/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g')
+
+# Query the gateway
+response=$(curl -sf "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${encoded_username}" 2>/dev/null)
+curl_status=$?
+
+if [[ $curl_status -ne 0 ]] || [[ -z "$response" ]]; then
+    echo '{"success": false, "error": "Failed to connect to gateway"}'
+    exit 0
+fi
+
+# Check for valid JSON
+if [[ ! "$response" =~ ^\{.*\}$ ]]; then
+    echo '{"success": false, "error": "Invalid response from gateway"}'
+    exit 0
+fi
+
+# Extract status using sed
+status=$(echo "$response" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+if [[ "$status" == "dead" ]]; then
+    echo '{"success": false, "error": "Bot is offline"}'
+    exit 0
+fi
+
+# Check if inGame is true
+if [[ ! "$response" =~ \"inGame\"[[:space:]]*:[[:space:]]*true ]]; then
+    echo '{"success": false, "error": "Bot is not in game"}'
+    exit 0
+fi
+
+# Check for player object (not null)
+if [[ "$response" =~ \"player\"[[:space:]]*:[[:space:]]*null ]]; then
+    echo '{"success": false, "error": "Location unavailable"}'
+    exit 0
+fi
+
+# Extract player data using sed
+# Look for: "player": { ... "name": "x", "worldX": 123, "worldZ": 456 ... }
+name=$(echo "$response" | sed -n 's/.*"player"[^}]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+worldX=$(echo "$response" | sed -n 's/.*"worldX"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+worldZ=$(echo "$response" | sed -n 's/.*"worldZ"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+
+if [[ -z "$worldX" ]] || [[ -z "$worldZ" ]]; then
+    echo '{"success": false, "error": "Could not parse location data"}'
+    exit 0
+fi
+
+echo "{\"success\": true, \"location\": {\"name\": \"${name}\", \"worldX\": ${worldX}, \"worldZ\": ${worldZ}}}"

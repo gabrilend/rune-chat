@@ -1,0 +1,46 @@
+#!/bin/bash
+# query_bot_status - Query status of a specific bot from the gateway
+# Protocol: --tool-info for JSON schema, stdin for execution args
+
+GATEWAY_HOST="${GATEWAY_HOST:-localhost}"
+GATEWAY_PORT="${GATEWAY_PORT:-8245}"
+
+if [[ "$1" == "--tool-info" ]]; then
+    cat << 'EOF'
+{"name": "query_bot_status", "description": "Query the status of a specific bot by username. Returns whether the bot is online, its game state, and player position if available.", "parameters": {"type": "object", "properties": {"username": {"type": "string", "description": "The bot's username to query"}}, "required": ["username"]}}
+EOF
+    exit 0
+fi
+
+# Read JSON input from stdin
+input=$(cat)
+
+# Extract username using sed (basic JSON parsing without jq)
+# Handles: {"username": "value"} or {"username":"value"}
+username=$(echo "$input" | sed -n 's/.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+if [[ -z "$username" ]]; then
+    echo '{"success": false, "error": "Missing required parameter: username"}'
+    exit 0
+fi
+
+# URL-encode the username (basic encoding for common chars)
+encoded_username=$(echo -n "$username" | sed 's/ /%20/g; s/!/%21/g; s/#/%23/g; s/\$/%24/g; s/&/%26/g')
+
+# Query the gateway
+response=$(curl -sf "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${encoded_username}" 2>/dev/null)
+curl_status=$?
+
+if [[ $curl_status -ne 0 ]] || [[ -z "$response" ]]; then
+    echo '{"success": false, "error": "Failed to connect to gateway"}'
+    exit 0
+fi
+
+# Check for valid JSON (has opening brace)
+if [[ ! "$response" =~ ^\{.*\}$ ]]; then
+    echo '{"success": false, "error": "Invalid response from gateway"}'
+    exit 0
+fi
+
+# Wrap response in success envelope
+echo "{\"success\": true, \"data\": ${response}}"

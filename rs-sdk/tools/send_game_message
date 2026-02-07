@@ -1,0 +1,115 @@
+#!/usr/bin/env bun
+// send_game_message - Send an in-game chat message
+//
+// This tool requires SDK context to work. It connects to the gateway
+// to send a message through an existing bot session.
+//
+// Lua port note: This would require the RS SDK Lua bindings or HTTP POST
+// to a gateway endpoint that accepts chat messages.
+// C port: Use libcurl or raw sockets to POST to gateway.
+//
+// NOTE: This tool is a stub - the gateway currently doesn't expose
+// a direct "send message" HTTP endpoint. In practice, messages are sent
+// through the SDK WebSocket connection from within bot scripts.
+// This tool demonstrates the protocol for future implementation.
+
+const TOOL_INFO = {
+    name: "send_game_message",
+    description: "Send a chat message in-game through a bot. Requires the bot to be online and in-game.",
+    parameters: {
+        type: "object",
+        properties: {
+            username: {
+                type: "string",
+                description: "The bot username to send the message as"
+            },
+            message: {
+                type: "string",
+                description: "The message to send (max 80 characters)"
+            }
+        },
+        required: ["username", "message"]
+    }
+};
+
+async function main() {
+    // Handle --tool-info flag
+    if (process.argv[2] === "--tool-info") {
+        console.log(JSON.stringify(TOOL_INFO));
+        process.exit(0);
+    }
+
+    // Read JSON input from stdin
+    let input: string;
+    try {
+        input = await Bun.stdin.text();
+    } catch {
+        console.log(JSON.stringify({ success: false, error: "Failed to read stdin" }));
+        return;
+    }
+
+    let args: { username?: string; message?: string };
+    try {
+        args = JSON.parse(input);
+    } catch {
+        console.log(JSON.stringify({ success: false, error: "Invalid JSON input" }));
+        return;
+    }
+
+    const { username, message } = args;
+
+    if (!username) {
+        console.log(JSON.stringify({ success: false, error: "Missing required parameter: username" }));
+        return;
+    }
+
+    if (!message) {
+        console.log(JSON.stringify({ success: false, error: "Missing required parameter: message" }));
+        return;
+    }
+
+    // Truncate message to 80 characters (game limit)
+    const truncatedMessage = message.substring(0, 80);
+
+    const gatewayHost = process.env.GATEWAY_HOST || "localhost";
+    const gatewayPort = process.env.GATEWAY_PORT || "8245";
+
+    // First check if the bot is online
+    try {
+        const statusUrl = `http://${gatewayHost}:${gatewayPort}/status/${encodeURIComponent(username)}`;
+        const statusResponse = await fetch(statusUrl);
+        const statusData = await statusResponse.json();
+
+        if (statusData.status === "dead") {
+            console.log(JSON.stringify({ success: false, error: "Bot is offline" }));
+            return;
+        }
+
+        if (!statusData.inGame) {
+            console.log(JSON.stringify({ success: false, error: "Bot is not in game" }));
+            return;
+        }
+
+        // NOTE: The gateway doesn't currently expose a "send message" HTTP endpoint.
+        // This would need to be added to gateway.ts, or this tool would need to
+        // establish a WebSocket connection as an SDK client.
+        //
+        // For now, return a "not implemented" response that explains the limitation.
+        // In a full implementation, this would POST to something like:
+        //   POST /bot/:username/say { "message": "..." }
+
+        console.log(JSON.stringify({
+            success: false,
+            error: "send_game_message requires gateway HTTP API support (not yet implemented). " +
+                   "Messages can be sent from within bot scripts using sdk.sendSay() or bot.say()."
+        }));
+
+    } catch (err) {
+        console.log(JSON.stringify({
+            success: false,
+            error: `Failed to connect to gateway: ${err instanceof Error ? err.message : String(err)}`
+        }));
+    }
+}
+
+main();

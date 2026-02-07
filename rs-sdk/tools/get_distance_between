@@ -1,0 +1,65 @@
+#!/bin/bash
+# get_distance_between - Calculate distance between two bots or a bot and a location
+# Protocol: --tool-info for JSON schema, stdin for execution args
+
+GATEWAY_HOST="${GATEWAY_HOST:-localhost}"
+GATEWAY_PORT="${GATEWAY_PORT:-8245}"
+
+if [[ "$1" == "--tool-info" ]]; then
+    cat << 'EOF'
+{"name": "get_distance_between", "description": "Calculate the distance between two bots, or between a bot and a location. Both bots must be online.", "parameters": {"type": "object", "properties": {"bot1": {"type": "string", "description": "Username of the first bot"}, "bot2": {"type": "string", "description": "Username of the second bot (optional if x,z provided)"}, "x": {"type": "number", "description": "X coordinate (optional if bot2 provided)"}, "z": {"type": "number", "description": "Z coordinate (optional if bot2 provided)"}}, "required": ["bot1"]}}
+EOF
+    exit 0
+fi
+
+input=$(cat)
+
+bot1=$(echo "$input" | sed -n 's/.*"bot1"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+bot2=$(echo "$input" | sed -n 's/.*"bot2"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+target_x=$(echo "$input" | sed -n 's/.*"x"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+target_z=$(echo "$input" | sed -n 's/.*"z"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+
+if [[ -z "$bot1" ]]; then
+    echo '{"success": false, "error": "Missing required parameter: bot1"}'
+    exit 0
+fi
+
+# Get bot1 position
+response1=$(curl -sf "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${bot1}" 2>/dev/null)
+if [[ -z "$response1" ]]; then
+    echo '{"success": false, "error": "Failed to get status for bot1"}'
+    exit 0
+fi
+
+x1=$(echo "$response1" | sed -n 's/.*"worldX"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+z1=$(echo "$response1" | sed -n 's/.*"worldZ"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+
+if [[ -z "$x1" || -z "$z1" ]]; then
+    echo '{"success": false, "error": "Bot1 position not available (not in game?)"}'
+    exit 0
+fi
+
+# Get target position (from bot2 or coordinates)
+if [[ -n "$bot2" ]]; then
+    response2=$(curl -sf "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${bot2}" 2>/dev/null)
+    if [[ -z "$response2" ]]; then
+        echo '{"success": false, "error": "Failed to get status for bot2"}'
+        exit 0
+    fi
+    target_x=$(echo "$response2" | sed -n 's/.*"worldX"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+    target_z=$(echo "$response2" | sed -n 's/.*"worldZ"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+fi
+
+if [[ -z "$target_x" || -z "$target_z" ]]; then
+    echo '{"success": false, "error": "Target position not available"}'
+    exit 0
+fi
+
+# Calculate Euclidean distance using bc or awk
+dx=$((target_x - x1))
+dz=$((target_z - z1))
+
+# Use awk for floating point sqrt
+distance=$(awk "BEGIN {printf \"%.1f\", sqrt($dx*$dx + $dz*$dz)}")
+
+echo "{\"success\": true, \"data\": {\"bot1\": {\"username\": \"${bot1}\", \"x\": ${x1}, \"z\": ${z1}}, \"target\": {\"x\": ${target_x}, \"z\": ${target_z}}, \"distance\": ${distance}, \"dx\": ${dx}, \"dz\": ${dz}}}"

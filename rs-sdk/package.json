@@ -1,0 +1,14 @@
+{
+  "name": "server",
+  "private": true,
+  "workspaces": ["mcp"],
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.5.3"
+  }
+}

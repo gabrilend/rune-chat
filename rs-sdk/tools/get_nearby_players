@@ -1,0 +1,49 @@
+#!/bin/bash
+# get_nearby_players - Get list of players near a bot
+# Protocol: --tool-info for JSON schema, stdin for execution args
+
+GATEWAY_HOST="${GATEWAY_HOST:-localhost}"
+GATEWAY_PORT="${GATEWAY_PORT:-8245}"
+
+if [[ "$1" == "--tool-info" ]]; then
+    cat << 'EOF'
+{"name": "get_nearby_players", "description": "Get a list of players near a specific bot. Requires the bot to be online.", "parameters": {"type": "object", "properties": {"username": {"type": "string", "description": "The bot's username to query nearby players for"}}, "required": ["username"]}}
+EOF
+    exit 0
+fi
+
+input=$(cat)
+username=$(echo "$input" | sed -n 's/.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+if [[ -z "$username" ]]; then
+    echo '{"success": false, "error": "Missing required parameter: username"}'
+    exit 0
+fi
+
+encoded_username=$(echo -n "$username" | sed 's/ /%20/g')
+
+response=$(curl -sf "http://${GATEWAY_HOST}:${GATEWAY_PORT}/status/${encoded_username}" 2>/dev/null)
+
+if [[ -z "$response" ]]; then
+    echo '{"success": false, "error": "Failed to connect to gateway or bot not found"}'
+    exit 0
+fi
+
+# Check if bot is online
+status=$(echo "$response" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+if [[ "$status" != "active" ]]; then
+    echo '{"success": false, "error": "Bot is not online"}'
+    exit 0
+fi
+
+# Extract nearbyPlayers array - this is complex without jq
+# For now, indicate the data is available in the full status
+in_game=$(echo "$response" | sed -n 's/.*"inGame"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
+
+if [[ "$in_game" != "true" ]]; then
+    echo '{"success": false, "error": "Bot is not in game"}'
+    exit 0
+fi
+
+# Return the full response - the caller can parse nearbyPlayers
+echo "{\"success\": true, \"data\": ${response}}"

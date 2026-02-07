@@ -1,0 +1,48 @@
+#!/bin/bash
+# list_available_behaviors - List behaviors available for bots to run
+# Protocol: --tool-info for JSON schema, stdin for execution args
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BEHAVIORS_DIR="${SCRIPT_DIR}/../behaviors"
+
+if [[ "$1" == "--tool-info" ]]; then
+    cat << 'EOF'
+{"name": "list_available_behaviors", "description": "List all available behaviors that bots can run. Returns behavior names and descriptions.", "parameters": {"type": "object", "properties": {}, "required": []}}
+EOF
+    exit 0
+fi
+
+# Read JSON input (not used but required by protocol)
+cat > /dev/null
+
+# List behaviors from behaviors directory
+behaviors="[]"
+
+if [[ -d "$BEHAVIORS_DIR" ]]; then
+    # Check for index.ts which exports all behaviors
+    if [[ -f "${BEHAVIORS_DIR}/index.ts" ]]; then
+        # Extract behavior names from export statements
+        names=$(grep -E "export.*Behavior" "${BEHAVIORS_DIR}/index.ts" | sed -n "s/.*'\(.*\)'.*/\1/p" | tr '\n' ',' | sed 's/,$//')
+
+        # Build JSON array manually
+        behaviors='['
+        first=1
+        for file in "${BEHAVIORS_DIR}"/*.ts; do
+            [[ ! -f "$file" ]] && continue
+            [[ "$file" == *"index.ts" ]] && continue
+
+            name=$(basename "$file" .ts)
+
+            # Try to extract description from file
+            desc=$(grep -E "description:" "$file" | head -1 | sed -n "s/.*description:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+            [[ -z "$desc" ]] && desc="Behavior from ${name}.ts"
+
+            [[ $first -eq 0 ]] && behaviors="${behaviors},"
+            behaviors="${behaviors}{\"name\": \"${name}\", \"description\": \"${desc}\"}"
+            first=0
+        done
+        behaviors="${behaviors}]"
+    fi
+fi
+
+echo "{\"success\": true, \"behaviors\": ${behaviors}}"

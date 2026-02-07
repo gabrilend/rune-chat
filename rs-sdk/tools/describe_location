@@ -1,0 +1,72 @@
+#!/usr/bin/env bun
+// describe_location - Convert coordinates to natural language description
+// Protocol: --tool-info for JSON schema, stdin for execution args
+//
+// This tool uses the locations module to generate natural descriptions.
+// NOTE: This is a TypeScript/Bun tool, not bash.
+
+import { describeLocation, describeCoordinates, getDirectionBetween, getDistanceBetween } from '../locations';
+
+// Handle --tool-info
+if (process.argv.includes('--tool-info')) {
+    console.log(JSON.stringify({
+        name: 'describe_location',
+        description: 'Convert coordinates to a natural language location description. Use this instead of giving raw coordinates.',
+        parameters: {
+            type: 'object',
+            properties: {
+                x: { type: 'number', description: 'X coordinate' },
+                z: { type: 'number', description: 'Z coordinate' },
+                destinationX: { type: 'number', description: 'Destination X if moving (optional)' },
+                destinationZ: { type: 'number', description: 'Destination Z if moving (optional)' },
+                isRunning: { type: 'boolean', description: 'True if running, false if walking (optional)' },
+                purpose: { type: 'string', description: 'What you\'re doing, e.g. "to smith bronze bars" (optional)' },
+            },
+            required: ['x', 'z'],
+        },
+    }));
+    process.exit(0);
+}
+
+// Read input from stdin
+const input = await Bun.stdin.text();
+
+try {
+    const args = JSON.parse(input);
+
+    if (typeof args.x !== 'number' || typeof args.z !== 'number') {
+        console.log(JSON.stringify({
+            success: false,
+            error: 'Missing required parameters: x, z',
+        }));
+        process.exit(0);
+    }
+
+    const result = describeLocation({
+        x: args.x,
+        z: args.z,
+        isMoving: args.destinationX !== undefined && args.destinationZ !== undefined,
+        isRunning: args.isRunning ?? false,
+        destinationX: args.destinationX,
+        destinationZ: args.destinationZ,
+        taskDescription: args.purpose,
+    });
+
+    console.log(JSON.stringify({
+        success: true,
+        data: {
+            description: result.description,
+            kingdom: result.kingdom,
+            town: result.town,
+            poi: result.poi,
+            movementType: result.movementType,
+            movementDirection: result.movementDirection,
+            movementDestination: result.movementDestination,
+        },
+    }));
+} catch (e) {
+    console.log(JSON.stringify({
+        success: false,
+        error: `Failed to parse input: ${e}`,
+    }));
+}
