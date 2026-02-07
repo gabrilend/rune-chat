@@ -1,0 +1,3 @@
+[submodule "rs-sdk"]
+	path = rs-sdk
+	url = https://github.com/gabrilend/r-c-sdk.git

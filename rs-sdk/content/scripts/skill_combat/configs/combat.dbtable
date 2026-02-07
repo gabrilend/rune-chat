@@ -1,3 +1,0 @@
-[combat_style_table]
-column=damagestyle,int,LIST
-column=damagetype,int,LIST

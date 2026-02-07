@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "rs-agent": {
-      "command": "bun",
-      "args": ["run", "mcp/server.ts"]
-    }
-  }
-}
