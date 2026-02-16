@@ -26,6 +26,8 @@ PROJECT_ROOT="/home/ritz/programming/ai-stuff/runescape/rs-sdk"
 START_ENGINE=true
 START_GATEWAY=true
 START_WEBCLIENT=false
+START_EDITOR=false
+EDITOR_PORT=3000
 DEV_MODE=false
 BACKGROUND=false
 BUILD_WEBCLIENT=false
@@ -42,6 +44,7 @@ ENGINE_RANDOM_EVENT_RATE=0
 ENGINE_DEBUG=true
 ENGINE_MAX_PLAYERS=2047
 ENGINE_MAX_NPCS=8191
+ENGINE_GAME_MODE=normal
 GATEWAY_PORT=8245
 DB_BACKEND=sqlite
 RUN_MIGRATIONS=false
@@ -169,7 +172,8 @@ ${BOLD}USAGE:${NC}
     $(basename "$0") [OPTIONS] [COMMAND]
 
 ${BOLD}COMMANDS:${NC}
-    start           Start the server (default)
+    start           Start the server (default if args given)
+    editor          Start the behavior profile editor (port 3000)
     stop            Stop all running components
     restart         Restart all components
     status          Show status of components
@@ -179,6 +183,8 @@ ${BOLD}COMMANDS:${NC}
     push-db         Push schema to database (no migration history)
     reset-db        Reset database (DANGEROUS)
     create-bot      Create a new bot (requires --bot-name)
+
+    If no command is given, an interactive selector is shown.
 
 ${BOLD}COMPONENT OPTIONS:${NC}
     -e, --engine                Start engine (default: on)
@@ -213,6 +219,7 @@ ${BOLD}ENGINE OPTIONS:${NC}
     --run-drain-rate NUM        Run energy drain rate (0=infinite, 100=normal, default: 0)
     --debug                     Enable debug mode (default)
     --no-debug                  Disable debug mode
+    --game-mode MODE            Game mode: normal|survival (default: normal)
 
 ${BOLD}GATEWAY OPTIONS:${NC}
     --gateway-port PORT         Gateway port (default: 8245)
@@ -285,10 +292,105 @@ show_version() {
 }
 
 # =============================================================================
+# INTERACTIVE SELECTOR
+# =============================================================================
+
+# Programs that can be launched from the interactive menu
+MENU_ITEMS=(
+    "server:Start game server (engine + gateway)"
+    "editor:Start behavior profile editor (port ${EDITOR_PORT})"
+)
+
+interactive_select() {
+    local selected=0
+    local count=${#MENU_ITEMS[@]}
+
+    # Hide cursor
+    printf '\033[?25l'
+
+    # Cleanup on exit
+    local cleanup_done=false
+    _selector_cleanup() {
+        if [[ "$cleanup_done" == "false" ]]; then
+            cleanup_done=true
+            printf '\033[?25h'  # Show cursor
+            # Clear the menu lines
+            for (( i=0; i<count+2; i++ )); do
+                printf '\033[2K\033[A'  # Clear line, move up
+            done
+            printf '\033[2K\r'  # Clear current line
+        fi
+    }
+    trap _selector_cleanup INT TERM
+
+    while true; do
+        # Print header
+        printf '\033[1m%s\033[0m\n' "What do you want to run?"
+        echo ""
+
+        # Print options
+        for (( i=0; i<count; i++ )); do
+            local item="${MENU_ITEMS[$i]}"
+            local name="${item%%:*}"
+            local desc="${item#*:}"
+
+            if [[ $i -eq $selected ]]; then
+                printf '  \033[36m❯ %s\033[0m  \033[2m%s\033[0m\n' "$name" "$desc"
+            else
+                printf '    %s  \033[2m%s\033[0m\n' "$name" "$desc"
+            fi
+        done
+
+        # Read a keypress
+        IFS= read -rsn1 key
+
+        case "$key" in
+            $'\x1b')
+                # Escape sequence - read the rest
+                read -rsn2 -t 0.01 seq
+                case "$seq" in
+                    '[A') # Up arrow
+                        (( selected = (selected - 1 + count) % count )) || true
+                        ;;
+                    '[B') # Down arrow
+                        (( selected = (selected + 1) % count )) || true
+                        ;;
+                esac
+                ;;
+            'k') # vim up
+                (( selected = (selected - 1 + count) % count )) || true
+                ;;
+            'j') # vim down
+                (( selected = (selected + 1) % count )) || true
+                ;;
+            '') # Enter
+                _selector_cleanup
+                trap - INT TERM
+
+                local chosen="${MENU_ITEMS[$selected]}"
+                INTERACTIVE_RESULT="${chosen%%:*}"
+                return 0
+                ;;
+            $'\x03') # Ctrl+C
+                _selector_cleanup
+                trap - INT TERM
+                exit 0
+                ;;
+        esac
+
+        # Move cursor back up to redraw
+        for (( i=0; i<count+2; i++ )); do
+            printf '\033[A\033[2K'
+        done
+        printf '\r'
+    done
+}
+
+# =============================================================================
 # ARGUMENT PARSING
 # =============================================================================
 
-COMMAND="start"
+COMMAND=""
 DRY_RUN=false
 DUMP_CONFIG=false
 
@@ -296,7 +398,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             # Commands
-            start|stop|restart|status|logs|build|migrate|push-db|reset-db|create-bot)
+            start|server|editor|stop|restart|status|logs|build|migrate|push-db|reset-db|create-bot)
                 COMMAND="$1"
                 shift
                 ;;
@@ -350,6 +452,10 @@ parse_args() {
             --run-drain-rate) ENGINE_RUN_DRAIN_RATE="$2"; shift 2 ;;
             --debug) ENGINE_DEBUG=true; shift ;;
             --no-debug) ENGINE_DEBUG=false; shift ;;
+            --game-mode) ENGINE_GAME_MODE="$2"; shift 2 ;;
+
+            # Editor options
+            --editor-port) EDITOR_PORT="$2"; shift 2 ;;
 
             # Gateway options
             --gateway-port) GATEWAY_PORT="$2"; shift 2 ;;
@@ -456,6 +562,7 @@ ${CYAN}Engine:${NC}
   ENGINE_MAX_PLAYERS=${ENGINE_MAX_PLAYERS}
   ENGINE_MAX_NPCS=${ENGINE_MAX_NPCS}
   ENGINE_CORS=${ENGINE_CORS}
+  ENGINE_GAME_MODE=${ENGINE_GAME_MODE}
 
 ${CYAN}Gateway:${NC}
   GATEWAY_PORT=${GATEWAY_PORT}
@@ -571,6 +678,7 @@ setup_engine_env() {
     [[ "$ENGINE_DEBUG" == "false" ]] && env_content+="NODE_DEBUG=false\n"
     [[ "$ENGINE_MAX_PLAYERS" != "2047" ]] && env_content+="NODE_MAX_PLAYERS=${ENGINE_MAX_PLAYERS}\n"
     [[ "$ENGINE_MAX_NPCS" != "8191" ]] && env_content+="NODE_MAX_NPCS=${ENGINE_MAX_NPCS}\n"
+    [[ "$ENGINE_GAME_MODE" != "normal" ]] && env_content+="NODE_GAME_MODE=${ENGINE_GAME_MODE}\n"
     env_content+="DB_BACKEND=${DB_BACKEND}\n"
     env_content+="GATEWAY_URL=http://localhost:${GATEWAY_PORT}\n"
 
@@ -635,7 +743,7 @@ is_running() {
 kill_existing_processes() {
     log info "Killing existing processes..."
 
-    for name in engine gateway webclient; do
+    for name in engine gateway webclient editor; do
         if is_running "$name"; then
             local pid
             pid=$(get_pid "$name")
@@ -653,6 +761,93 @@ kill_existing_processes() {
     fi
 
     sleep 1
+}
+
+# =============================================================================
+# CONTENT BUILD
+# =============================================================================
+
+content_needs_rebuild() {
+    local build_marker="${PROJECT_ROOT}/engine/data/pack/server/build"
+
+    # No build marker = never built
+    if [[ ! -f "$build_marker" ]]; then
+        log debug "No build marker found, rebuild needed"
+        return 0
+    fi
+
+    # Check if any content file is newer than the build marker
+    local changed
+    changed=$(find "${PROJECT_ROOT}/content" -newer "$build_marker" -type f 2>/dev/null | head -1)
+    if [[ -n "$changed" ]]; then
+        log debug "Content changed (e.g. $changed), rebuild needed"
+        return 0
+    fi
+
+    return 1
+}
+
+build_content() {
+    if content_needs_rebuild; then
+        log info "Content changes detected, rebuilding..."
+
+        cd "${PROJECT_ROOT}/engine"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log info "[DRY RUN] Would run: bun run build"
+            return
+        fi
+
+        bun run build
+        log success "Content build complete"
+    else
+        log info "Content up to date, skipping build"
+    fi
+}
+
+webclient_needs_rebuild() {
+    local build_marker="${PROJECT_ROOT}/engine/public/client/client.js"
+
+    # No built client = never built
+    if [[ ! -f "$build_marker" ]]; then
+        log debug "No webclient build found, rebuild needed"
+        return 0
+    fi
+
+    # Check if any webclient source file is newer than the built output
+    local changed
+    changed=$(find "${PROJECT_ROOT}/webclient/src" -newer "$build_marker" -type f 2>/dev/null | head -1)
+    if [[ -n "$changed" ]]; then
+        log debug "Webclient changed (e.g. $changed), rebuild needed"
+        return 0
+    fi
+
+    return 1
+}
+
+build_webclient_if_needed() {
+    if webclient_needs_rebuild; then
+        log info "Webclient changes detected, rebuilding..."
+
+        cd "${PROJECT_ROOT}/webclient"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log info "[DRY RUN] Would build and copy webclient"
+            return
+        fi
+
+        bun run build
+        log success "Webclient built"
+
+        # Copy output to engine public directory
+        mkdir -p "${PROJECT_ROOT}/engine/public/client"
+        mkdir -p "${PROJECT_ROOT}/engine/public/bot"
+        cp "${PROJECT_ROOT}/webclient/out/standard/"* "${PROJECT_ROOT}/engine/public/client/"
+        cp "${PROJECT_ROOT}/webclient/out/bot/"* "${PROJECT_ROOT}/engine/public/bot/"
+        log success "Webclient deployed to engine"
+    else
+        log info "Webclient up to date, skipping build"
+    fi
 }
 
 # =============================================================================
@@ -847,6 +1042,29 @@ start_webclient() {
     fi
 }
 
+start_editor() {
+    log info "Starting behavior editor on port ${EDITOR_PORT}..."
+
+    cd "${PROJECT_ROOT}"
+
+    local cmd="EDITOR_PORT=${EDITOR_PORT} bun behavior-editor/server.ts"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log info "[DRY RUN] Would run: $cmd"
+        return
+    fi
+
+    if [[ "$BACKGROUND" == "true" ]]; then
+        eval "$cmd" > "${PID_DIR}/editor.log" 2>&1 &
+        save_pid "editor" $!
+        log success "Editor started in background (PID: $!)"
+    else
+        eval "$cmd" &
+        save_pid "editor" $!
+        log success "Editor started (PID: $!)"
+    fi
+}
+
 # =============================================================================
 # STATUS
 # =============================================================================
@@ -854,7 +1072,7 @@ start_webclient() {
 show_status() {
     log header "Component Status"
 
-    for name in engine gateway webclient; do
+    for name in engine gateway webclient editor; do
         if is_running "$name"; then
             local pid
             pid=$(get_pid "$name")
@@ -886,7 +1104,7 @@ show_status() {
 stop_all() {
     log header "Stopping All Components"
 
-    for name in engine gateway webclient; do
+    for name in engine gateway webclient editor; do
         if is_running "$name"; then
             local pid
             pid=$(get_pid "$name")
@@ -1011,6 +1229,12 @@ do_start() {
         copy_client_files
     fi
 
+    # Build content and webclient if needed (before engine starts)
+    if [[ "$START_ENGINE" == "true" ]]; then
+        build_content
+        build_webclient_if_needed
+    fi
+
     # Start components
     if [[ "$START_ENGINE" == "true" ]]; then
         start_engine
@@ -1026,6 +1250,10 @@ do_start() {
         start_webclient
     fi
 
+    if [[ "$START_EDITOR" == "true" ]]; then
+        start_editor
+    fi
+
     # Open browser
     open_browser
 
@@ -1039,9 +1267,10 @@ do_start() {
     log success "Server started!"
     echo ""
     echo -e "${BOLD}URLs:${NC}"
-    echo -e "  Web client: ${CYAN}http://localhost:${ENGINE_WEB_PORT}${NC}"
-    echo -e "  Game port:  ${CYAN}localhost:${ENGINE_GAME_PORT}${NC}"
-    echo -e "  Gateway:    ${CYAN}ws://localhost:${GATEWAY_PORT}${NC}"
+    [[ "$START_ENGINE" == "true" ]] && echo -e "  Web client: ${CYAN}http://localhost:${ENGINE_WEB_PORT}${NC}"
+    [[ "$START_ENGINE" == "true" ]] && echo -e "  Game port:  ${CYAN}localhost:${ENGINE_GAME_PORT}${NC}"
+    [[ "$START_GATEWAY" == "true" ]] && echo -e "  Gateway:    ${CYAN}ws://localhost:${GATEWAY_PORT}${NC}"
+    [[ "$START_EDITOR" == "true" ]] && echo -e "  Editor:     ${CYAN}http://localhost:${EDITOR_PORT}${NC}"
     echo ""
 
     if [[ "$BACKGROUND" != "true" ]]; then
@@ -1070,10 +1299,31 @@ main() {
         exit 0
     fi
 
+    # If no command given, show interactive selector
+    if [[ -z "$COMMAND" ]]; then
+        if [[ -t 0 ]] && [[ -t 1 ]]; then
+            interactive_select
+            COMMAND="$INTERACTIVE_RESULT"
+        else
+            # Non-interactive (piped, etc.) — default to start
+            COMMAND="start"
+        fi
+    fi
+
     # Execute command
     case "$COMMAND" in
-        start)
+        start|server)
             do_start
+            ;;
+        editor)
+            log header "Starting Behavior Editor"
+            mkdir_pid_dir
+            start_editor
+            log success "Editor running at ${CYAN}http://localhost:${EDITOR_PORT}${NC}"
+            if [[ "$BACKGROUND" != "true" ]]; then
+                log info "Press Ctrl+C to stop"
+                wait
+            fi
             ;;
         stop)
             stop_all
