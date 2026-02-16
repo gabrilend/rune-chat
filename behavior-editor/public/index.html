@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Behavior Profile Editor</title>
+    <link rel="stylesheet" href="editor.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Toolbar -->
+        <div id="toolbar">
+            <div class="toolbar-group">
+                <button id="btn-new" title="New Profile (Ctrl+N)">New</button>
+                <button id="btn-save" title="Save (Ctrl+S)">Save</button>
+                <select id="profile-select" title="Load Profile">
+                    <option value="">-- Load Profile --</option>
+                </select>
+                <button id="btn-delete" title="Delete Profile">Delete</button>
+            </div>
+            <div class="toolbar-group">
+                <input id="profile-name" type="text" placeholder="Profile Name" />
+            </div>
+            <div class="toolbar-group">
+                <button id="btn-compile" title="Compile to TypeScript">Compile</button>
+                <button id="btn-export" title="Export JSON">Export</button>
+                <button id="btn-import" title="Import JSON">Import</button>
+                <input id="import-file" type="file" accept=".json" style="display:none" />
+            </div>
+            <div class="toolbar-group">
+                <select id="bot-select" title="Activate on Bot">
+                    <option value="">-- Select Bot --</option>
+                </select>
+                <button id="btn-activate" title="Activate on Bot">Activate</button>
+            </div>
+            <div class="toolbar-group toolbar-right">
+                <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
+                <button id="btn-redo" title="Redo (Ctrl+Y)">Redo</button>
+                <span id="zoom-display">100%</span>
+            </div>
+        </div>
+
+        <div id="main-area">
+            <!-- Left Sidebar - Properties Panel -->
+            <div id="sidebar">
+                <div id="panel-placeholder">
+                    <p>Double-click or right-click canvas to add states</p>
+                    <p>Click a state or transition to edit</p>
+                </div>
+
+                <!-- State Properties -->
+                <div id="state-panel" class="panel" style="display:none">
+                    <h3>State Properties</h3>
+                    <label>Name
+                        <input id="state-name" type="text" />
+                    </label>
+                    <label>Behavior
+                        <select id="state-behavior"></select>
+                    </label>
+                    <div id="behavior-description" class="hint"></div>
+                    <div id="behavior-params"></div>
+                    <label>Color
+                        <input id="state-color" type="color" value="#4a9eff" />
+                    </label>
+
+                    <h4>Interrupt Handlers</h4>
+                    <div id="interrupt-handlers"></div>
+
+                    <h4>Data Ports</h4>
+                    <div id="ports-list"></div>
+                </div>
+
+                <!-- Transition Properties -->
+                <div id="transition-panel" class="panel" style="display:none">
+                    <h3>Transition Properties</h3>
+                    <label>Label
+                        <input id="transition-label" type="text" placeholder="Optional label" />
+                    </label>
+                    <label>Priority
+                        <input id="transition-priority" type="number" min="0" max="100" value="10" />
+                    </label>
+                    <label>Condition Type
+                        <select id="transition-condition-type">
+                            <option value="behavior_complete">Behavior Complete</option>
+                            <option value="timer">Timer</option>
+                            <option value="inventory_percent_full">Inventory % Full</option>
+                            <option value="health_percent">Health %</option>
+                            <option value="item_count">Item Count</option>
+                            <option value="skill_level">Skill Level</option>
+                            <option value="always">Always</option>
+                        </select>
+                    </label>
+                    <div id="condition-params"></div>
+                </div>
+            </div>
+
+            <!-- Canvas -->
+            <canvas id="editor-canvas"></canvas>
+        </div>
+
+        <!-- Context Menu -->
+        <div id="context-menu" style="display:none">
+            <div class="menu-item" data-action="add-state">Add State</div>
+            <div class="menu-item" data-action="set-initial">Set as Initial State</div>
+            <div class="menu-separator"></div>
+            <div class="menu-item" data-action="delete">Delete</div>
+        </div>
+
+        <!-- Compile Output Modal -->
+        <div id="compile-modal" style="display:none">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Generated TypeScript</h3>
+                    <button id="modal-close">&times;</button>
+                </div>
+                <pre id="compile-output"></pre>
+            </div>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div id="toast-container"></div>
+    </div>
+
+    <script src="editor.js"></script>
+</body>
+</html>

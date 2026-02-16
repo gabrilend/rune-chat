@@ -1,0 +1,116 @@
+{
+  "id": "00000000-0000-0000-0000-000000000001",
+  "name": "Wander and Idle",
+  "description": "Alternates between wandering and idling. Transitions to idle on low health.",
+  "version": 1,
+  "createdAt": "2025-01-01T00:00:00.000Z",
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "initialStateId": "state-wander",
+  "states": [
+    {
+      "id": "state-wander",
+      "name": "Wander Around",
+      "behaviorName": "wander",
+      "behaviorParams": {
+        "maxMoves": 5,
+        "wanderRadius": 8
+      },
+      "interruptHandlers": [
+        { "interruptType": "dm", "action": "pause" },
+        { "interruptType": "nearby_chat", "action": "ignore" },
+        { "interruptType": "combat", "action": "transition", "targetStateId": "state-idle" },
+        { "interruptType": "player_interaction", "action": "pause" },
+        { "interruptType": "low_health", "action": "transition", "targetStateId": "state-idle" },
+        { "interruptType": "timer_complete", "action": "ignore" }
+      ],
+      "x": 100,
+      "y": 100,
+      "color": "#2ecc71"
+    },
+    {
+      "id": "state-idle",
+      "name": "Rest and Idle",
+      "behaviorName": "idle",
+      "behaviorParams": {
+        "maxTicks": 60
+      },
+      "interruptHandlers": [
+        { "interruptType": "dm", "action": "pause" },
+        { "interruptType": "nearby_chat", "action": "ignore" },
+        { "interruptType": "combat", "action": "pause" },
+        { "interruptType": "player_interaction", "action": "pause" },
+        { "interruptType": "low_health", "action": "ignore" },
+        { "interruptType": "timer_complete", "action": "ignore" }
+      ],
+      "x": 400,
+      "y": 100,
+      "color": "#4a9eff"
+    },
+    {
+      "id": "state-social",
+      "name": "Chat Mode",
+      "behaviorName": "social",
+      "behaviorParams": {
+        "maxTicks": 300
+      },
+      "interruptHandlers": [
+        { "interruptType": "dm", "action": "ignore" },
+        { "interruptType": "nearby_chat", "action": "ignore" },
+        { "interruptType": "combat", "action": "transition", "targetStateId": "state-idle" },
+        { "interruptType": "player_interaction", "action": "ignore" },
+        { "interruptType": "low_health", "action": "transition", "targetStateId": "state-idle" },
+        { "interruptType": "timer_complete", "action": "ignore" }
+      ],
+      "x": 250,
+      "y": 280,
+      "color": "#f39c12"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "trans-wander-to-idle",
+      "fromStateId": "state-wander",
+      "toStateId": "state-idle",
+      "condition": { "type": "behavior_complete" },
+      "priority": 10,
+      "label": "done wandering"
+    },
+    {
+      "id": "trans-idle-to-wander",
+      "fromStateId": "state-idle",
+      "toStateId": "state-wander",
+      "condition": { "type": "behavior_complete" },
+      "priority": 10,
+      "label": "done resting"
+    },
+    {
+      "id": "trans-wander-to-social",
+      "fromStateId": "state-wander",
+      "toStateId": "state-social",
+      "condition": { "type": "timer", "durationMs": 60000 },
+      "priority": 5,
+      "label": "1 min timer"
+    },
+    {
+      "id": "trans-social-to-wander",
+      "fromStateId": "state-social",
+      "toStateId": "state-wander",
+      "condition": { "type": "behavior_complete" },
+      "priority": 10,
+      "label": "done chatting"
+    },
+    {
+      "id": "trans-wander-lowhealth",
+      "fromStateId": "state-wander",
+      "toStateId": "state-idle",
+      "condition": { "type": "health_percent", "operator": "<", "value": 30 },
+      "priority": 50,
+      "label": "hp < 30%"
+    }
+  ],
+  "editorMeta": {
+    "canvasOffsetX": 50,
+    "canvasOffsetY": 50,
+    "zoom": 1
+  }
+}
